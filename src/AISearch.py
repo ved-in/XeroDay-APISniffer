@@ -45,7 +45,6 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.prompt import Prompt
-from rich.text import Text
 
 
 LEAKS_JSON = "leaked_keys.json"
