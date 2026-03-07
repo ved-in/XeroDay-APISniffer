@@ -1,45 +1,86 @@
 # XeroDay's API Sniffer
 
-API Sniffer is a modular toolkit for scanning publicly available GitHub repositories and identifying exposed API keys, tokens, and secrets. It is part of the X3r0Day Framework and is designed for security research, defensive analysis, and responsible disclosure.
+API Sniffer is a GitHub-focused secret discovery toolkit for scanning public repositories and identifying exposed API keys, tokens, webhooks, and other sensitive credentials. It is part of the X3r0Day Framework and is built for security research, defensive analysis, and responsible disclosure.
 
-The tool works in three stages: discovery, scanning, and querying. Each stage is handled by a dedicated script that reads from and writes to shared JSON files on disk, allowing them to run independently or as part of an automated pipeline.
+The project is organized around discovery, scanning, and querying, with an AI-first launcher, a workflow orchestrator, shared routing and search utilities, scanner dashboard helpers, repo-target extraction helpers, and a small test suite for scanner behavior.
 
 ---
 
 ## How It Works
 
-API Sniffer operates as a three-stage pipeline. Each stage produces output that feeds into the next.
+API Sniffer supports two operating modes:
 
-**Stage 1 – Discovery (`APISniffer.py`)**: Searches GitHub for recently created repositories within a set time window. New results are filtered to avoid duplicates and saved to a local queue file. Proxy rotation helps handle rate limits.
+1. **AI-first launch path** through `main.py` -> `AIWorkflow.py`, where natural-language requests are routed into discovery, scanning, direct database querying, or chained workflows.
+2. **Manual stage execution** where you run the modules yourself or use the numbered launcher menu.
 
-**Stage 2 – Scanning (`APIScanner.py`)**: Takes repositories from the discovery stage, downloads their source archives, and scans selected files using regex patterns. It also checks commit history via Atom feed patches. Found secrets are stored in a JSON database, and a multithreaded dashboard shows real-time scanning progress.
+The core pipeline is:
 
-**Stage 3 – AI-Assisted Search (`AISearch.py`)**: Lets users search the leaked keys database using natural language. A language model (Llama-3 via Groq as default) interprets the query and finds matching API key categories, then displays the results in a formatted table. This feature is optional and requires a Groq API key.
+**Stage 1 - Discovery (`APISniffer.py`)**: Queries GitHub for newly created public repositories across a recent time window, deduplicates them against the live queue and prior scan history, and stores fresh targets in `recent_repos.json`.
+
+**Stage 2 - Scanning (`APIScanner.py`)**: Pulls repositories from the queue, resolves the repo's default branch when needed, downloads repository archives, scans matching files, optionally scans recent commit patches, and writes results into `leaked_keys.json`, `clean_repos.json`, or `failed_repos.json`.
+
+**Stage 3 - AI Search (`AISearch.py`)**: Queries the local findings database with natural language. The search runtime is shared with the AI workflow, so database questions like `show all the API keys` can be answered directly from the launcher flow.
+
+**Shared runtime modules (`src/shared/`)**: Hold reusable logic for API signature definitions, category routing, AI-assisted search, scanner matching, scanner dashboard rendering, and GitHub repo target extraction.
+
+### Project Flow
+
+```text
+main.py
+├── Enter
+│   └── src/AIWorkflow.py
+│       ├── Query request -> src/shared/ai_search_runtime.py -> leaked_keys.json
+│       ├── Discovery request -> src/APISniffer.py -> recent_repos.json
+│       ├── Scanner request -> src/APIScanner.py -> leaked_keys.json / clean_repos.json / failed_repos.json
+│       └── Mixed request -> orchestrated multi-step workflow
+└── Manual
+    └── Control Center
+        ├── src/APISniffer.py
+        ├── src/APIScanner.py
+        ├── src/AISearch.py
+        └── src/AIWorkflow.py
+```
 
 ---
 
 ## Project Structure
 
-```
+```text
 API Sniffer/
+├── main.py                         # Unified launcher / control center entry point
 ├── src/
-│   ├── APISniffer.py        # Stage 1: GitHub repository discovery
-│   ├── APIScanner.py        # Stage 2: Repository scanning and secret detection
-│   └── AISearch.py          # Stage 3: AI-powered database search
+│   ├── APISniffer.py               # Stage 1: GitHub repository discovery
+│   ├── APIScanner.py               # Stage 2: Repository scanning and secret detection
+│   ├── AISearch.py                 # Stage 3: AI-powered local database search
+│   ├── AIWorkflow.py               # AI workflow router and stage orchestrator
+│   └── shared/
+│       ├── __init__.py
+│       ├── ai_search_runtime.py    # Shared AI query runtime used by AISearch and AIWorkflow
+│       ├── api_signatures.py       # Secret signature definitions
+│       ├── category_routing.py     # Query/category inference helpers
+│       ├── scanner_dashboard.py    # Rich dashboard rendering for the scanner
+│       ├── scanner_matcher.py      # Regex matching and finding extraction
+│       └── scanner_targets.py      # Repo target extraction from prompts/URLs
+├── tests/
+│   ├── test_scanner_branches.py    # Default-branch resolution coverage
+│   └── test_scanner_targets.py     # Repo target parsing coverage
 ├── requirements.txt
-├── .gitignore
+├── live_proxies.txt                # Optional proxy list provided by the user
 └── README.md
 ```
 
-The following files are generated at runtime and excluded from version control:
+The following files are generated at runtime and are not part of the source code:
 
 | File | Purpose |
 |---|---|
-| `recent_repos.json` | Queue of discovered repositories pending scan |
+| `recent_repos.json` | Queue of discovered repositories waiting to be scanned |
 | `leaked_keys.json` | Database of detected secrets |
-| `clean_repos.json` | Repositories that passed scanning with no findings |
+| `clean_repos.json` | Repositories that were scanned with no findings |
 | `failed_repos.json` | Repositories that failed to download or parse |
-| `live_proxies.txt` | Optional list of HTTP proxies (one per line, `ip:port` format) |
+
+Optional local input file:
+
+- `live_proxies.txt` - User-managed proxy list in `ip:port` format
 
 ---
 
@@ -58,7 +99,26 @@ pip install -r requirements.txt
 
 ## Execution Order
 
-The scripts are meant to be run sequentially. Each stage depends on the output of the previous one.
+The modules can run one by one, and the launcher provides the fastest path through the full workflow.
+
+### Unified Launcher (Recommended)
+
+```bash
+python main.py
+```
+
+This opens the launcher. From there:
+
+- Press `Enter` to open the AI workflow directly
+- Type `help` to see how the workflow works
+- Type `Manual` to open the numbered control center
+
+Example requests:
+
+- `show all the API keys`
+- `find any Discord tokens`
+- `start scanning`
+- `run discovery for 3 minutes, then scan`
 
 ### Stage 1: Discover Repositories
 
@@ -66,7 +126,7 @@ The scripts are meant to be run sequentially. Each stage depends on the output o
 python src/APISniffer.py
 ```
 
-This queries GitHub for repositories created in the last 100 minutes (configurable via `LOOKBACK_MINS`) and writes new entries to `recent_repos.json`. If your IP gets rate-limited, it will fall back to proxies listed in `live_proxies.txt`.
+This queries GitHub for recently created repositories and writes fresh entries to `recent_repos.json`. Discovery also skips repositories that already exist in the queue or in the historical output files (`clean_repos.json`, `failed_repos.json`, and `leaked_keys.json`). If your IP gets rate-limited, it can fall back to proxies from `live_proxies.txt`.
 
 ### Stage 2: Scan for Leaked Secrets
 
@@ -74,22 +134,33 @@ This queries GitHub for repositories created in the last 100 minutes (configurab
 python src/APIScanner.py
 ```
 
-This reads from `recent_repos.json`, downloads each repository as a ZIP archive, and scans the contents against 37 API key signatures. Results are written to `leaked_keys.json`, `clean_repos.json`, or `failed_repos.json` depending on the outcome. Scanned repositories are removed from the queue.
+This reads from `recent_repos.json`, resolves the repository's default branch when possible, downloads each repository as a ZIP archive, and scans it against the supported secret signatures. It can also inspect recent commit patches. Results are written to `leaked_keys.json`, `clean_repos.json`, or `failed_repos.json`. Scanned repositories are removed from the queue.
 
-The scanner opens a full-screen terminal dashboard. Press **Space** to pause or resume scanning. Pausing also triggers a proxy list reload from disk, so you can update `live_proxies.txt` without restarting.
+The scanner opens a full-screen terminal dashboard.
 
-### Stage 3: Query the Database (Optional)
+- Press `Space` to pause or resume
+- Press `i` to insert GitHub repo targets while the scanner is running
+- Repo insertion accepts GitHub URLs or `owner/repo` targets and pushes them into the live queue
+
+### Stage 3: Query the Database
 
 ```bash
 python src/AISearch.py
 ```
 
-This opens an interactive prompt where you can ask natural language questions about the scan results. It requires a Groq API key, which can be provided through the `GROQ_API_KEY` environment variable or entered at the prompt.
+This opens the AI search prompt for the local database. It requires a Groq API key, which can be set through `GROQ_API_KEY` or entered at runtime.
+
+You can also run a one-shot query without opening the interactive prompt:
+
+```bash
+python src/AISearch.py --query "Show all AWS keys"
+```
 
 Example queries:
-- "Show me all AWS keys"
-- "Find any Discord tokens"
-- "List all AI-related API keys"
+
+- `Show me all AWS keys`
+- `Find any Discord tokens`
+- `List all AI-related API keys`
 
 ---
 
@@ -97,57 +168,59 @@ Example queries:
 
 All network-facing scripts support HTTP proxy rotation. Create a file named `live_proxies.txt` in the working directory with one proxy per line:
 
-```
+```text
 103.21.244.0:8080
 45.77.56.114:3128
 192.168.1.100:8888
 ```
 
-Proxies are used as a fallback when direct connections to GitHub are rate-limited or blocked. The scanner shuffles the proxy list before each attempt.
+Proxies are used as a fallback when direct GitHub requests are rate-limited or blocked.
 
 ---
 
 ## Supported API Key Signatures
 
-The scanner detects the following secret types:
+The signature set includes:
 
 | Category | Examples |
 |---|---|
-| AI and LLM Providers | OpenAI, Anthropic, Groq, xAI (Grok), OpenRouter, HuggingFace, Replicate, Cerebras |
-| Cloud Platforms | AWS Access Keys, AWS Session Tokens, DigitalOcean, Heroku, Google Cloud, Databricks |
-| Source Control | GitHub PATs, GitLab PATs |
+| AI and LLM Providers | OpenAI (legacy/project), Anthropic, Groq, xAI (Grok), OpenRouter, HuggingFace, Replicate, Cerebras |
+| Cloud and Infrastructure | AWS Access Keys, AWS Session Tokens, DigitalOcean, Google API/GCP, Heroku, Databricks |
+| Source Control | GitHub classic PATs, GitHub fine-grained PATs, GitLab PATs |
 | Package Registries | NPM, PyPI |
-| Communication | Discord (Bot Tokens, Webhooks), Slack (Bot, User, Webhooks), Telegram |
-| Payment and Commerce | Stripe, Square, Shopify |
+| Communication and Webhooks | Discord bot tokens, Discord webhooks, Slack bot/user tokens, Slack webhooks, Telegram |
+| Payments and Commerce | Stripe, Square, Shopify |
 | Email and Messaging | SendGrid, Mailgun, Twilio |
-| Other | Postman, Mapbox, Sentry |
+| Database and Backend Services | Supabase, Firebase, PlanetScale, Airtable, Appwrite, Deta, PocketBase |
+| Other Utilities | Postman, Mapbox, Sentry |
 
 ---
 
 ## Configuration
 
-Key parameters can be adjusted by editing the constants at the top of each script.
+Key values can be adjusted by editing the constants at the top of the scripts.
 
 **APISniffer.py**
-- `LOOKBACK_MINS` — How far back in time to search for new repositories (default: 100 minutes)
-- `PAGES_TO_SCRAPE` — Number of GitHub API result pages to fetch (default: 10, at 100 results per page)
-- `PROXY_RETRY_LIMIT` — Maximum number of proxies to try before giving up (default: 200)
+- `LOOKBACK_MINS` - How far back to search for new repositories
+- `CHUNK_MINS` - Time window size used per GitHub search chunk
+- `PAGES_TO_SCRAPE` - Number of GitHub API result pages to fetch
+- `PROXY_RETRY_LIMIT` - Maximum number of proxies to try before giving up
 
 **APIScanner.py**
-- `MAX_THREADS` — Number of concurrent scanning threads (default: 15)
-- `SCAN_COMMIT_HISTORY` — Whether to scan commit diffs in addition to the latest source (default: True)
-- `MAX_HISTORY_DEPTH` — Number of recent commits to scan (default: 10)
-- `SCAN_HEROKU_KEYS` — Whether to include the Heroku UUID pattern, which can produce false positives (default: False)
-- `FAT_FILE_LIMIT` — Skip individual files larger than this size in bytes (default: 10 MB)
-- `MAX_DOWNLOAD_SIZE_BYTES` — Abort downloads exceeding this size (default: 20 MB)
+- `MAX_THREADS` - Number of concurrent scanning threads
+- `SCAN_COMMIT_HISTORY` - Whether to scan commit diffs as well
+- `MAX_HISTORY_DEPTH` - Number of recent commits to scan
+- `SCAN_HEROKU_KEYS` - Whether to include the Heroku UUID pattern
+- `FAT_FILE_LIMIT` - Skip files larger than this size
+- `MAX_DOWNLOAD_SIZE_BYTES` - Abort downloads larger than this size
 
 ---
 
 ## Disclaimer
 
-This tool is intended for educational purposes, security research, and defensive analysis only. It queries publicly available GitHub repository metadata and does not exploit, access, or modify any system.
+This tool is intended for educational purposes, security research, and defensive analysis only. It works with public repository data and does not exploit, access, or modify any system.
 
-Users are solely responsible for how this software is used. Always respect platform policies, rate limits, and the privacy of developers. If you discover sensitive information or exposed credentials during research, follow responsible disclosure practices and notify the affected parties.
+Use it responsibly, respect platform rules and rate limits, and follow responsible disclosure practices if you discover exposed credentials.
 
 ---
 

@@ -42,24 +42,25 @@
 #   422 = No more results after that   #
 #   200 = OKAY/GOOD                    #
 #   403 = Access Denied                #
-#   404 = Not Found                    #
+#   404 = Not Found/Empty Repo)        #
 # ------------------------------------ #
 
 
 
 
-import requests, random, json, io, os, sys, zipfile, re, time, threading
+import argparse
+import requests, random, json, io, os, sys, zipfile, re, time, threading, signal, tempfile
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Optional, Tuple
 
 from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.layout import Layout
 from rich.console import Console
-from rich.text import Text
+from shared.api_signatures import build_api_signatures
+from shared.scanner_dashboard import paint_dashboard as render_scanner_dashboard
+from shared.scanner_matcher import regex_grep_text as grep_scanner_text
+from shared.scanner_targets import resolve_repo_targets as resolve_scanner_targets
 
 
 QUEUE_JSON = "recent_repos.json"
@@ -68,6 +69,7 @@ DEAD_TARGETS_JSON = "failed_repos.json"
 BORING_REPOS_JSON = "clean_repos.json"
 PROXY_LIST_TXT = "live_proxies.txt"
 MAX_THREADS = 15          
+DEFAULT_BRANCH_FALLBACKS = ("main", "master")
 
 SCAN_HEROKU_KEYS = False                 
 SCAN_COMMIT_HISTORY = True           
@@ -91,81 +93,150 @@ TARGET_EXTENSIONS = (
 )
 EXACT_FILENAMES = ("dockerfile", "makefile", "gemfile")
 
-# Lol I used wget UA cuz when I made request from wget i didn't get 403 but with spoofed UA I got 403
+# This user agent is used because GitHub was less likely to return 403 for archive requests.
 SPOOFED_USER_AGENT = "Wget/1.21.2"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+AI_TARGET_REQUEST_TIMEOUT = 15
 
-API_SIGNATURES = {
-    "OpenAI API Key (Legacy)": re.compile(r"\bsk-[a-zA-Z0-9]{48}\b"),
-    "OpenAI API Key (Project)": re.compile(r"\bsk-proj-[a-zA-Z0-9\-_]{48,}\b"),
-    "Anthropic API Key": re.compile(r"\bsk-ant-api03-[a-zA-Z0-9\-_]{60,100}\b"),
-    "Google API/GCP Key": re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
-    "OpenRouter API Key": re.compile(r"\bsk-or-v1-[a-zA-Z0-9]{64}\b"),
-    "xAI (Grok) API Key": re.compile(r"\bxai-[a-zA-Z0-9\-_]{60,100}\b"),
-    "Groq API Key": re.compile(r"\bgsk_[a-zA-Z0-9]{32,64}\b"),
-    "HuggingFace Token": re.compile(r"\bhf_[a-zA-Z]{34}\b"),
-    "Replicate Token": re.compile(r"\br8_[a-zA-Z0-9]{37}\b"),
-    "Cerebras Token": re.compile(r"\bcs-[a-zA-Z0-9]{32,64}\b"),
-    "AWS Access Key ID": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    "AWS Session Token": re.compile(r"\bASIA[0-9A-Z]{16}\b"),
-    "DigitalOcean PAT": re.compile(r"\bdop_v1_[a-f0-9]{64}\b"),
-    "Heroku API Key": re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
-    "Mapbox API Key": re.compile(r"\b(?:pk|sk)\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
-    "Sentry Token": re.compile(r"\bsntrys_[a-zA-Z0-9_-]{64,}\b"),
-    "Databricks PAT": re.compile(r"\bdapi[a-h0-9]{32}\b"),
-    "GitHub Classic PAT": re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}\b"),
-    "GitHub Fine-Grained PAT": re.compile(r"\bgithub_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}\b"),
-    "GitLab PAT": re.compile(r"\bglpat-[a-zA-Z0-9\-]{20}\b"),
-    "NPM Access Token": re.compile(r"\b(?:npm_[a-zA-Z0-9]{36})\b"),
-    "PyPI Upload Token": re.compile(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9\-_]{50,150}\b"),
-    "Postman API Key": re.compile(r"\bPMAK-[a-f0-9]{24}-[a-f0-9]{34}\b"),
-    "Discord Bot Token": re.compile(r"\b[MNO][a-zA-Z0-9_-]{23,27}\.[a-zA-Z0-9_-]{6}\.[a-zA-Z0-9_-]{27,38}\b"),
-    "Discord Webhook": re.compile(r"https://discord\.com/api/webhooks/[0-9]{17,19}/[a-zA-Z0-9_-]{60,68}"),
-    "Slack Bot Token": re.compile(r"\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}\b"),
-    "Slack User Token": re.compile(r"\bxox[pausr]-[0-9]{10,13}-[a-zA-Z0-9]{24,32}\b"),
-    "Slack Webhook": re.compile(r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8,10}/B[a-zA-Z0-9_]{8,10}/[a-zA-Z0-9_]{24}"),
-    "Telegram Bot Token": re.compile(r"\b[0-9]{8,10}:[a-zA-Z0-9_-]{35}\b"),
-    "Twilio API Key": re.compile(r"\bSK[0-9a-fA-F]{32}\b"),
-    "SendGrid API Key": re.compile(r"\bSG\.[a-zA-Z0-9_\-\.]{66}\b"),
-    "Mailgun API Key": re.compile(r"\bkey-[0-9a-zA-Z]{32}\b"),
-    "Stripe Secret Key": re.compile(r"\b(?:sk|rk)_(?:test|live)_[0-9a-zA-Z]{24,99}\b"),
-    "Square Access Token": re.compile(r"\bsq0atp-[0-9A-Za-z\-_]{22,43}\b"),
-    "Square OAuth Secret": re.compile(r"\bsq0csp-[0-9A-Za-z\-_]{43}\b"),
-    "Shopify Access Token": re.compile(r"\bshpat_[a-fA-F0-9]{32}\b"),
-    "Shopify Custom App": re.compile(r"\bshpca_[a-fA-F0-9]{32}\b"),
-    "Supabase PAT": re.compile(r"\bsbp_[a-zA-Z0-9]{40}\b"),
-    "Supabase Anon/Service Role JWT": re.compile(r"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+"),
-    "Firebase Server Key": re.compile(r"\bAAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}\b"),
-    "Firebase Database URL": re.compile(r"https:\/\/[a-z0-9-]+\.firebaseio\.com"),
-    "PlanetScale Password": re.compile(r"\bpscale_pw_[a-zA-Z0-9_\.\-]{43}\b"),
-    "PlanetScale OAuth Token": re.compile(r"\bpscale_oauth_[a-zA-Z0-9_\.\-]{32,64}\b"),
-    "Airtable PAT": re.compile(r"\bpat[a-zA-Z0-9]{14}\.[a-zA-Z0-9]{64}\b"),
-    "Appwrite API Key": re.compile(r"(?i)appwrite[\w\s=-]{0,20}(?:key|token|secret)[\w\s=:\"\'-]{0,10}\b([a-zA-Z0-9\-_]{32,})\b"),
-    "Deta Token": re.compile(r"(?i)deta[\w\s=-]{0,20}(?:key|token)[\w\s=:\"\'-]{0,10}\b([a-zA-Z0-9_]{32,})\b"),
-    "PocketBase Token": re.compile(r"(?i)pocketbase[\w\s=-]{0,20}(?:key|token|admin)[\w\s=:\"\'-]{0,10}\b([a-zA-Z0-9\-_]{32,})\b"),
-}
+API_SIGNATURES = build_api_signatures(include_heroku=SCAN_HEROKU_KEYS)
 
 console = Console()
 ui_mutex = threading.Lock()
 io_mutex = threading.Lock() 
 
-pause_event = threading.Event()
-pause_event.set() 
+tag_mutex = threading.Lock()
+
+pause_event = None
 exit_prog = False
-active_proxies =[]
+active_proxies = []
 
 # To check if new target should be injected
 is_typing_url = False
 input_buffer = ""
-new_manual_targets = []
+manual_target_queue = deque()
+manual_target_names = set()
 
-available_thread_tags = deque([f"Thread-{i+1}" for i in range(MAX_THREADS)])
-tag_mutex = threading.Lock()
-
-thread_dashboard = {f"Thread-{i+1}": {"target": "Idle", "action": "-", "active_ip": "-", "clock_start": 0, "dl_bytes": 0} for i in range(MAX_THREADS)}
+available_thread_tags = deque()
+thread_dashboard = {}
 log_history = deque(maxlen=6)
 fail_history = deque(maxlen=10)
 leak_history = deque(maxlen=10)
 scoreboard = {"total": 0, "scanned": 0, "leaks": 0, "clean": 0, "failed": 0, "remaining": 0}
+manual_target_mutex = threading.Lock()
+
+
+class ScanInterrupted(Exception):
+    pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Scan discovered repositories for leaked secrets.")
+    parser.add_argument("--max-threads", type=int, help="Number of concurrent scanning workers.")
+    parser.add_argument("--history-depth", type=int, help="Number of recent commits to scan.")
+    parser.add_argument("--scan-heroku-keys", action="store_true", help="Enable Heroku key pattern scanning.")
+    parser.add_argument("--no-commit-history", action="store_true", help="Disable commit history scanning.")
+    return parser.parse_args()
+
+
+def apply_runtime_overrides(args) -> None:
+    global MAX_THREADS, MAX_HISTORY_DEPTH, SCAN_HEROKU_KEYS, SCAN_COMMIT_HISTORY
+
+    if args.max_threads is not None:
+        MAX_THREADS = max(1, args.max_threads)
+    if args.history_depth is not None:
+        MAX_HISTORY_DEPTH = max(1, args.history_depth)
+    if args.scan_heroku_keys:
+        SCAN_HEROKU_KEYS = True
+    if args.no_commit_history:
+        SCAN_COMMIT_HISTORY = False
+
+
+def reset_runtime_state() -> None:
+    global API_SIGNATURES, pause_event, exit_prog, active_proxies
+    global is_typing_url, input_buffer, manual_target_queue, manual_target_names
+    global available_thread_tags, thread_dashboard
+    global log_history, fail_history, leak_history, scoreboard
+
+    API_SIGNATURES = build_api_signatures(include_heroku=SCAN_HEROKU_KEYS)
+
+    pause_event = threading.Event()
+    pause_event.set()
+    exit_prog = False
+    active_proxies = []
+
+    is_typing_url = False
+    input_buffer = ""
+    manual_target_queue = deque()
+    manual_target_names = set()
+
+    available_thread_tags = deque([f"Thread-{i+1}" for i in range(MAX_THREADS)])
+    thread_dashboard = {
+        f"Thread-{i+1}": {
+            "target": "Idle",
+            "action": "-",
+            "active_ip": "-",
+            "clock_start": 0,
+            "dl_bytes": 0,
+        }
+        for i in range(MAX_THREADS)
+    }
+    log_history = deque(maxlen=6)
+    fail_history = deque(maxlen=10)
+    leak_history = deque(maxlen=10)
+    scoreboard = {"total": 0, "scanned": 0, "leaks": 0, "clean": 0, "failed": 0, "remaining": 0}
+
+
+def write_json_snapshot(payload: list, filepath: str) -> None:
+    directory = os.path.dirname(os.path.abspath(filepath)) or "."
+    file_prefix = f".{os.path.basename(filepath)}."
+    file_descriptor, temp_path = tempfile.mkstemp(prefix=file_prefix, suffix=".tmp", dir=directory)
+
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file_ptr:
+            json.dump(payload, file_ptr, indent=4)
+            file_ptr.flush()
+            os.fsync(file_ptr.fileno())
+        os.replace(temp_path, filepath)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def ensure_json_list_file(filepath: str) -> None:
+    if os.path.exists(filepath):
+        return
+    write_json_snapshot([], filepath)
+
+
+def request_shutdown(_signum=None, _frame=None) -> None:
+    global exit_prog
+    if exit_prog:
+        return
+    exit_prog = True
+    if pause_event is not None:
+        pause_event.set()
+    log_msg("[bold yellow][!] Stop requested. Finishing active work and leaving the remaining queue on disk.[/]")
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, request_shutdown)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_shutdown)
+
+
+def interruptible_sleep(seconds: float) -> bool:
+    deadline = time.time() + max(0.0, seconds)
+    while time.time() < deadline:
+        if exit_prog:
+            return False
+        time.sleep(min(0.1, deadline - time.time()))
+    return not exit_prog
+
+
+def raise_if_exit_requested() -> None:
+    if exit_prog:
+        raise ScanInterrupted
 
 def read_proxies(filepath: str = PROXY_LIST_TXT) -> List[str]:
     try:
@@ -202,11 +273,15 @@ def keyboard_monitor():
         while not exit_prog:
             if msvcrt.kbhit():
                 char = msvcrt.getch()
+                if char == b"\x03":
+                    request_shutdown()
+                    return
                 if is_typing_url:
                     if char in[b'\r', b'\n']:
-                        handle_new_url(input_buffer)
+                        submitted_prompt = input_buffer
                         is_typing_url = False
                         input_buffer = ""
+                        submit_target_prompt(submitted_prompt)
                     elif char == b'\x08': # Backspace
                         input_buffer = input_buffer[:-1]
                     elif char == b'\x1b': # Esc
@@ -219,11 +294,13 @@ def keyboard_monitor():
                 else:
                     if char in [b' ', b' ']:
                         toggle_pause()
-                        time.sleep(0.3) 
+                        if not interruptible_sleep(0.3):
+                            return
                     elif char.lower() == b'i':
                         is_typing_url = True
                         input_buffer = ""
-            time.sleep(0.1)
+            if not interruptible_sleep(0.1):
+                return
     else:
         import select, tty, termios
         fd = sys.stdin.fileno()
@@ -234,11 +311,15 @@ def keyboard_monitor():
             while not exit_prog:
                 if select.select([sys.stdin],[],[], 0.1)[0]:
                     char = sys.stdin.read(1)
+                    if char == "\x03":
+                        request_shutdown()
+                        return
                     if is_typing_url:
                         if char in ['\n', '\r']:
-                            handle_new_url(input_buffer)
+                            submitted_prompt = input_buffer
                             is_typing_url = False
                             input_buffer = ""
+                            submit_target_prompt(submitted_prompt)
                         elif char in ['\x7f', '\b']: # Backspace
                             input_buffer = input_buffer[:-1]
                         elif char == '\x1b': # Esc
@@ -249,7 +330,8 @@ def keyboard_monitor():
                     else:
                         if char == ' ':
                             toggle_pause()
-                            time.sleep(0.3) 
+                            if not interruptible_sleep(0.3):
+                                return
                         elif char.lower() == 'i':
                             is_typing_url = True
                             input_buffer = ""
@@ -266,10 +348,12 @@ def update_thread_board(thread_tag: str, target=None, action=None, active_ip=Non
             if dl_bytes is not None: thread_dashboard[thread_tag]["dl_bytes"] = dl_bytes
 
 def check_pause(thread_tag: str, current_action: str, current_ip: str):
-    if not pause_event.is_set():
+    while not pause_event.is_set():
+        raise_if_exit_requested()
         update_thread_board(thread_tag, action="[bold red]⏸ PAUSED[/]", active_ip="-")
-        pause_event.wait()
-        update_thread_board(thread_tag, action=current_action, active_ip=current_ip)
+        pause_event.wait(0.1)
+    raise_if_exit_requested()
+    update_thread_board(thread_tag, action=current_action, active_ip=current_ip)
 
 def log_msg(msg: str):
     with ui_mutex: log_history.append(msg)
@@ -293,40 +377,111 @@ def dump_json_safely(filepath: str, json_blob: dict):
             try:
                 with open(filepath, "r", encoding="utf-8") as file_ptr:
                     disk_content = json.load(file_ptr)
-            except json.JSONDecodeError: pass
-        disk_content.append(json_blob)
-        with open(filepath, "w", encoding="utf-8") as file_ptr:
-            json.dump(disk_content, file_ptr, indent=4)
+                    if not isinstance(disk_content, list):
+                        disk_content = []
+            except json.JSONDecodeError:
+                disk_content = []
 
-def handle_new_url(url_text: str):
-    global new_manual_targets, scoreboard
-    url_text = url_text.strip()
-    if not url_text: return
-    match = re.search(r'(?:github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)', url_text)
-    if match:
-        repo_name = match.group(1)
-        if repo_name.endswith('.git'): repo_name = repo_name[:-4]
-        repo_data = {"name": repo_name, "url": f"https://github.com/{repo_name}"}
-        
-        with io_mutex:
-            current_queue =[]
-            if os.path.exists(QUEUE_JSON):
-                try:
-                    with open(QUEUE_JSON, "r", encoding="utf-8") as f:
-                        current_queue = json.load(f)
-                except Exception: pass
-            
-            if not any(r.get("name") == repo_name for r in current_queue):
-                current_queue.append(repo_data)
-                with open(QUEUE_JSON, "w", encoding="utf-8") as f:
-                    json.dump(current_queue, f, indent=4)
-                    
-        new_manual_targets.append(repo_data)
-        bump_score("total", 1)
-        bump_score("remaining", 1)
-        log_msg(f"[bold green][+] Inserted manual target:[/] {repo_name}")
-    else:
-        log_msg(f"[bold red][!] Invalid URL/Repo format for manual insert.[/]")
+        repo_key = repo_identity(json_blob.get("repo") or json_blob.get("name"))
+        replaced_existing = False
+
+        if repo_key:
+            for idx, existing_entry in enumerate(disk_content):
+                if not isinstance(existing_entry, dict):
+                    continue
+                existing_key = repo_identity(existing_entry.get("repo") or existing_entry.get("name"))
+                if existing_key == repo_key:
+                    disk_content[idx] = json_blob
+                    replaced_existing = True
+                    break
+
+        if not replaced_existing:
+            disk_content.append(json_blob)
+
+        write_json_snapshot(disk_content, filepath)
+
+def repo_identity(repo_name: str) -> str:
+    return (repo_name or "").strip().lower()
+
+def resolve_repo_targets(prompt_text: str) -> List[dict]:
+    return resolve_scanner_targets(
+        prompt_text,
+        os.environ.get("GROQ_API_KEY", "").strip(),
+        GROQ_API_URL,
+        GROQ_MODEL,
+        AI_TARGET_REQUEST_TIMEOUT,
+        log_msg,
+    )
+
+def queue_manual_target(repo_data: dict) -> bool:
+    repo_name = repo_data["name"]
+    repo_key = repo_identity(repo_name)
+
+    with manual_target_mutex:
+        if repo_key in manual_target_names:
+            log_msg(f"[bold yellow][!] Target already pending:[/] {repo_name}")
+            return False
+
+    with io_mutex:
+        current_queue = []
+        if os.path.exists(QUEUE_JSON):
+            try:
+                with open(QUEUE_JSON, "r", encoding="utf-8") as f:
+                    current_queue = json.load(f)
+            except Exception:
+                current_queue = []
+
+        if any(repo_identity(r.get("name", "")) == repo_key for r in current_queue):
+            log_msg(f"[bold yellow][!] Target already queued:[/] {repo_name}")
+            return False
+
+        current_queue.append(repo_data)
+        write_json_snapshot(current_queue, QUEUE_JSON)
+
+    with manual_target_mutex:
+        manual_target_queue.append(repo_data)
+        manual_target_names.add(repo_key)
+
+    bump_score("total", 1)
+    bump_score("remaining", 1)
+    log_msg(f"[bold green][+] Inserted target:[/] {repo_name}")
+    return True
+
+def pop_manual_target() -> Optional[dict]:
+    with manual_target_mutex:
+        if not manual_target_queue:
+            return None
+        repo_data = manual_target_queue.popleft()
+        manual_target_names.discard(repo_identity(repo_data.get("name", "")))
+        return repo_data
+
+def has_manual_targets() -> bool:
+    with manual_target_mutex:
+        return bool(manual_target_queue)
+
+def handle_target_prompt(prompt_text: str):
+    cleaned_prompt = prompt_text.strip()
+    if not cleaned_prompt:
+        return
+
+    log_msg("[bold cyan][AI] Parsing repository targets from prompt...[/]")
+    repo_targets = resolve_repo_targets(cleaned_prompt)
+    if not repo_targets:
+        log_msg("[bold red][!] No valid GitHub repositories found in the submitted prompt.[/]")
+        return
+
+    inserted_count = 0
+    for repo_data in repo_targets:
+        if queue_manual_target(repo_data):
+            inserted_count += 1
+
+    if inserted_count > 1:
+        log_msg(f"[bold green][+] Added {inserted_count} repositories from AI prompt.[/]")
+
+def submit_target_prompt(prompt_text: str):
+    if not prompt_text.strip():
+        return
+    threading.Thread(target=handle_target_prompt, args=(prompt_text,), daemon=True).start()
 
 def remove_from_queue(target_repo: str):
     with io_mutex:
@@ -335,11 +490,11 @@ def remove_from_queue(target_repo: str):
             with open(QUEUE_JSON, "r", encoding="utf-8") as file_ptr:
                 current_queue = json.load(file_ptr)
             fresh_queue =[r for r in current_queue if r.get("name") != target_repo]
-            with open(QUEUE_JSON, "w", encoding="utf-8") as file_ptr:
-                json.dump(fresh_queue, file_ptr, indent=4)
+            write_json_snapshot(fresh_queue, QUEUE_JSON)
         except Exception: pass
 
 def fetch_with_progress(url: str, headers: dict, proxy_dict: Optional[dict], thread_tag: str, ip_str: str, action_label: str) -> bytes:
+    raise_if_exit_requested()
     last_chunk_time = time.time()
     total_bytes = 0
     last_ui_update = 0
@@ -353,9 +508,10 @@ def fetch_with_progress(url: str, headers: dict, proxy_dict: Optional[dict], thr
             
             content = bytearray()
             for chunk in r.iter_content(chunk_size=32768):
+                raise_if_exit_requested()
                 if not pause_event.is_set():
-                    pause_event.wait()
-                    last_chunk_time = time.time() 
+                    check_pause(thread_tag, action_label, ip_str)
+                    last_chunk_time = time.time()
                     
                 if time.time() - last_chunk_time > IDLE_STALL_TIMEOUT_SEC:
                     return b"TIMEOUT"
@@ -374,18 +530,22 @@ def fetch_with_progress(url: str, headers: dict, proxy_dict: Optional[dict], thr
                         
             return bytes(content)
             
+    except ScanInterrupted:
+        raise
     except requests.exceptions.ReadTimeout: return b"TIMEOUT"
     except requests.exceptions.ChunkedEncodingError: return b"CONN_DROPPED"
     except requests.exceptions.ConnectionError: return b"CONN_ERROR"
     except Exception: return b"FAILED_EXC"
-
+# This tries the direct download path first and only falls back to proxies for retryable failures.
 def download_github_url(target_url: str, thread_tag: str, action_label: str) -> Tuple[Optional[bytes], str]:
     global active_proxies
+    raise_if_exit_requested()
     http_headers = {"User-Agent": SPOOFED_USER_AGENT}
     
     res = b"FAILED"
     
     for attempt in range(6):
+        raise_if_exit_requested()
         action_str = f"[yellow]Connecting...[/]" if attempt == 0 else f"[yellow]Retrying Direct ({attempt}/5)...[/]"
         check_pause(thread_tag, action_str, "Direct IP")
         update_thread_board(thread_tag, action=action_str, active_ip="Direct IP", dl_bytes=0)
@@ -398,25 +558,29 @@ def download_github_url(target_url: str, thread_tag: str, action_label: str) -> 
         if not (isinstance(res, bytes) and (res in[b"TIMEOUT", b"RATE_LIMITED", b"FORBIDDEN", b"CONN_DROPPED", b"CONN_ERROR", b"FAILED_EXC"] or res.startswith(b"FAILED"))):
             return res, "Direct IP"
             
-        # This will check 403 multiple times cuz sometimes it may give false positive depending on the proxy and IP (According to my observation)
+        # Retry 403 a few times before giving up.
+        # In practice, the same target can briefly flip between allowed and forbidden responses.
         if res == b"FORBIDDEN":
-            time.sleep(1.5)
+            if not interruptible_sleep(1.5):
+                raise ScanInterrupted
             continue
             
-        # For other errors which idk I didn't added will retry 2 times
+        # Retry a smaller number of times for other transient failures so one repo does not stall the queue.
         if attempt >= 1:
             break
         else:
-            time.sleep(1.0)
+            if not interruptible_sleep(1.0):
+                raise ScanInterrupted
             continue
             
-    # If we exhausted all retries and it's STILL a 403, we completely skip proxy fallback
+    # If direct access still ends in 403 after the retries, skip proxy fallback entirely.
     if res == b"FORBIDDEN":
         update_thread_board(thread_tag, action=f"[red]Direct Forbidden (403) - Skipping[/]", active_ip="Direct IP", dl_bytes=0)
-        time.sleep(1.0)
+        if not interruptible_sleep(1.0):
+            raise ScanInterrupted
         return b"FORBIDDEN_SKIP", "Direct IP"
 
-    # I have these error parsings for now...
+    # Turn transport errors into short status text for the dashboard.
     reason_str = "Failed"
     if res == b"RATE_LIMITED": reason_str = "Rate Limited"
     elif res == b"TIMEOUT": reason_str = "Timeout"
@@ -426,13 +590,15 @@ def download_github_url(target_url: str, thread_tag: str, action_label: str) -> 
         reason_str = f"Failed ({res.split(b'_')[1].decode()})"
 
     update_thread_board(thread_tag, action=f"[red]Direct {reason_str}[/]", active_ip="Direct IP", dl_bytes=0)
-    time.sleep(1.0)
+    if not interruptible_sleep(1.0):
+        raise ScanInterrupted
 
     mixed_proxies = active_proxies[:]
     if not mixed_proxies: return b"FAILED", "-"
     random.shuffle(mixed_proxies)
 
     for proxy_ip in mixed_proxies:
+        raise_if_exit_requested()
         check_pause(thread_tag, "[cyan]Testing Proxy...[/]", proxy_ip)
         update_thread_board(thread_tag, action="[cyan]Testing Proxy...[/]", active_ip=proxy_ip, dl_bytes=0)
         proxy_dict = {"http": f"http://{proxy_ip}", "https": f"http://{proxy_ip}"}
@@ -446,23 +612,68 @@ def download_github_url(target_url: str, thread_tag: str, action_label: str) -> 
     return b"FAILED", "All Proxies Failed"
 
 def regex_grep_text(raw_text: str, filename: str) -> List[dict]:
-    caught_keys =[]
-    for line_idx, line_data in enumerate(raw_text.splitlines(), 1):
-        if len(line_data) > LINE_CUTOFF:
-            split_pieces =[line_data[i:i+LINE_CUTOFF] for i in range(0, len(line_data), LINE_CUTOFF)]
-        else:
-            split_pieces = [line_data]
-            
-        for piece in split_pieces:
-            for api_name, regex_obj in API_SIGNATURES.items():
-                for hit in regex_obj.finditer(piece):
-                    caught_keys.append({
-                        "file": filename, "line": line_idx,
-                        "type": api_name, "secret": hit.group(0)
-                    })
-    return caught_keys
+    return grep_scanner_text(raw_text, filename, API_SIGNATURES, LINE_CUTOFF)
 
+def normalize_branch_name(branch_name: Optional[str]) -> Optional[str]:
+    if not isinstance(branch_name, str):
+        return None
+    cleaned_branch = branch_name.strip().strip("/")
+    if cleaned_branch.startswith("refs/heads/"):
+        cleaned_branch = cleaned_branch[len("refs/heads/"):]
+    return cleaned_branch or None
+
+def fetch_repo_metadata(repo_name: str, thread_tag: str) -> Tuple[Optional[dict], str]:
+    metadata_url = f"https://api.github.com/repos/{repo_name}"
+    metadata_bytes, current_ip = download_github_url(metadata_url, thread_tag, "Resolving Repo Metadata")
+    if not metadata_bytes or metadata_bytes in [b"FAILED", b"TOO_LARGE", b"FORBIDDEN_SKIP"]:
+        return None, current_ip
+
+    try:
+        metadata = json.loads(metadata_bytes.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None, current_ip
+
+    return metadata if isinstance(metadata, dict) else None, current_ip
+
+def resolve_default_branch(repo_data: dict, thread_tag: str) -> Optional[str]:
+    stored_branch = normalize_branch_name(repo_data.get("default_branch"))
+    if stored_branch:
+        return stored_branch
+
+    repo_name = repo_data.get("name", "").strip()
+    if not repo_name:
+        return None
+
+    metadata, _ = fetch_repo_metadata(repo_name, thread_tag)
+    if not metadata:
+        return None
+
+    resolved_branch = normalize_branch_name(metadata.get("default_branch"))
+    if resolved_branch:
+        repo_data["default_branch"] = resolved_branch
+    return resolved_branch
+
+def build_archive_branch_candidates(repo_data: dict, thread_tag: str) -> List[str]:
+    branch_candidates = []
+    seen_branches = set()
+
+    def add_branch(branch_name: Optional[str]) -> None:
+        normalized_branch = normalize_branch_name(branch_name)
+        if not normalized_branch or normalized_branch in seen_branches:
+            return
+        seen_branches.add(normalized_branch)
+        branch_candidates.append(normalized_branch)
+
+    add_branch(repo_data.get("default_branch"))
+    add_branch(resolve_default_branch(repo_data, thread_tag))
+    for fallback_branch in DEFAULT_BRANCH_FALLBACKS:
+        add_branch(fallback_branch)
+
+    return branch_candidates
+
+# This scans one repository end to end and returns the final payload used for persistence.
 def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
+    raise_if_exit_requested()
     start_time = time.time()
     target_repo = repo_data.get("name", "Unknown_Repo")
     
@@ -470,15 +681,18 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
     
     zip_buffer = None
     successful_ip = "Direct IP"
-    successful_branch = "main"
+    branch_candidates = build_archive_branch_candidates(repo_data, thread_tag)
+    successful_branch = branch_candidates[0] if branch_candidates else DEFAULT_BRANCH_FALLBACKS[0]
     
 
-    for git_branch in ["main", "master"]:
+    # Try the known default branch first, then fall back to common names.
+    for git_branch in branch_candidates:
+        raise_if_exit_requested()
         download_link = f"https://codeload.github.com/{target_repo}/zip/refs/heads/{git_branch}"
         zip_buffer, current_ip = download_github_url(download_link, thread_tag, "Downloading ZIP")
         successful_ip = current_ip
         
-        # This'll just give up if got hit by 403 on the Direct IP
+        # Stop early if the direct IP is consistently forbidden.
         if zip_buffer == b"FORBIDDEN_SKIP":
             break
             
@@ -511,12 +725,15 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
     try:
         with zipfile.ZipFile(io.BytesIO(zip_buffer)) as zipped_archive:
             for zipped_file in zipped_archive.infolist():
+                raise_if_exit_requested()
                 check_pause(thread_tag, "[magenta]Scanning File...[/]", successful_ip)
                 if zipped_file.is_dir() or zipped_file.file_size > FAT_FILE_LIMIT: continue
                 
                 lowered_name = zipped_file.filename.lower()
                 clean_filename = lowered_name.split('/')[-1]
                 
+                # Keep the scan focused on text-like files where secrets usually live.
+                # For example, this skips binaries and large generated assets.
                 if not (lowered_name.endswith(TARGET_EXTENSIONS) or clean_filename in EXACT_FILENAMES): continue
                 
                 if time.time() - last_ui_update > 0.1:
@@ -534,7 +751,8 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
         bump_score("failed"); bump_score("scanned")
         return {"repo": target_repo, "status": "failed", "reason": "BadZipFile", "ip": successful_ip, "time_taken": round(time.time() - start_time, 2)}
 
-    # Scan the repo's commit history using the Atom feed and pull patch files to check for anything interesting
+    # Scan recent commit history as patch text as well.
+    # For example, a key removed from the working tree can still appear in an older commit.
     if SCAN_COMMIT_HISTORY:
         atom_url = f"https://github.com/{target_repo}/commits/{successful_branch}.atom"
         atom_bytes, current_ip = download_github_url(atom_url, thread_tag, "Downloading History")
@@ -553,6 +771,7 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
             commit_shas = unique_shas[:MAX_HISTORY_DEPTH]
             
             for idx, sha in enumerate(commit_shas):
+                raise_if_exit_requested()
                 patch_url = f"https://github.com/{target_repo}/commit/{sha}.patch"
                 patch_action_str = f"DL Patch {idx+1}/{len(commit_shas)}"
                 patch_bytes, patch_ip = download_github_url(patch_url, thread_tag, patch_action_str)
@@ -571,6 +790,8 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
     if caught_keys:
         unique_findings =[]
         seen_secrets = set()
+        # Deduplicate by secret value so the same token does not flood the report.
+        # For example, the same key may appear in both a source file and a patch.
         for k in caught_keys:
             if k["secret"] not in seen_secrets:
                 seen_secrets.add(k["secret"])
@@ -584,86 +805,22 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
         return {"repo": target_repo, "url": repo_data.get("url"), "status": "leaked", "total_secrets": len(unique_findings), "findings": unique_findings, "ip": successful_ip, "time_taken": elapsed}
     else:
         bump_score("clean")
-        log_msg(f"[green][✓] Clean:[/] {target_repo} [dim]({elapsed}s)[/]")
+        log_msg(f"[green][+] Clean:[/] {target_repo} [dim]({elapsed}s)[/]")
         return {"repo": target_repo, "url": repo_data.get("url"), "status": "clean", "ip": successful_ip, "time_taken": elapsed}
 
-def paint_dashboard() -> Layout:
-    with ui_mutex:
-        global is_typing_url, input_buffer
-        state_tag = "[bold green]▶ RUNNING[/]" if pause_event.is_set() else "[bold blink red]⏸ PAUSED (Press SPACE to Resume)[/]"
-        top_bar_text = (
-            f"{state_tag}  |  "
-            f"[bold white]Queue Remaining:[/] {scoreboard['remaining']}  |  "
-            f"[bold cyan]Scanned:[/] {scoreboard['scanned']}  |  "
-            f"[bold green]Clean:[/] {scoreboard['clean']}  |  "
-            f"[bold red]Leaks:[/] {scoreboard['leaks']}  |  "
-            f"[bold yellow]Failed:[/] {scoreboard['failed']}"
-        )
-        
-        thread_grid = Table(expand=True, border_style="cyan", padding=(0, 1))
-        thread_grid.add_column("Worker", style="dim", width=10)
-        thread_grid.add_column("Target Repository", width=28)
-        thread_grid.add_column("Status / Progress", width=42)
-        thread_grid.add_column("Active IP", width=20)
-        thread_grid.add_column("Elapsed", justify="right", width=10)
-
-        for thread_tag, current_state in thread_dashboard.items():
-            time_spent = "-"
-            
-            target_str = current_state["target"]
-            if len(target_str) > 25:
-                target_str = target_str[:22] + "..."
-
-            action_str = current_state["action"]
-            
-            if current_state["dl_bytes"] > 0 and "DL" in action_str:
-                mb_downloaded = current_state["dl_bytes"] / (1024 * 1024)
-                
-                fill_ratio = min(1.0, current_state["dl_bytes"] / MAX_DOWNLOAD_SIZE_BYTES)
-                blocks_filled = int(fill_ratio * 12)
-                bar_graphic = "█" * blocks_filled + "░" * (12 - blocks_filled)
-                
-                action_str = f"[yellow]DL [{bar_graphic}] {mb_downloaded:.1f}MB[/]"
-
-            if current_state["target"] != "Idle":
-                if pause_event.is_set() and current_state["clock_start"] > 0:
-                    seconds_passed = time.time() - current_state["clock_start"]
-                    color_code = "green" if seconds_passed < 5 else "yellow" if seconds_passed < 15 else "red"
-                    time_spent = f"[{color_code}]{seconds_passed:.1f}s[/]"
-                else:
-                    time_spent = "[dim]Paused[/]"
-
-            thread_grid.add_row(thread_tag, target_str, action_str, current_state["active_ip"], time_spent)
-
-        screen_layout = Layout()
-        screen_layout.split_column(
-            Layout(Panel(top_bar_text, title=f"[bold magenta]XeroDay-API Scanner 1.0 (Hunting {len(API_SIGNATURES)} API Types)[/]", border_style="magenta"), size=3),
-            Layout(name="bottom_section")
-        )
-        
-        input_prompt = "[yellow]Type URL and press Enter (Esc to cancel):[/] " if is_typing_url else "[dim]Press 'i' to manually insert a GitHub repo URL[/]"
-        display_text = input_prompt + ("[bold white]" + input_buffer + "[/]" if is_typing_url else "")
-        input_panel = Panel(display_text, title="[bold green]Manual Target Insertion[/]", border_style="green")
-
-        left_layout = Layout(ratio=5)
-        left_layout.split_column(
-            Layout(Panel(thread_grid, title="[bold cyan]Active Thread Dashboard[/]", border_style="cyan")),
-            Layout(input_panel, size=3)
-        )
-        
-        screen_layout["bottom_section"].split_row(
-            left_layout,
-            Layout(name="logs_section", ratio=3)
-        )
-        
-        system_feed = Text.from_markup("\n".join(log_history)) if log_history else Text("Awaiting events...", style="dim")
-        bounty_feed = Text.from_markup("\n".join(leak_history)) if leak_history else Text("No leaks found yet.", style="dim")
-        
-        screen_layout["logs_section"].split_column(
-            Layout(Panel(bounty_feed, title="[bold red]Recent Leaks Found[/]", border_style="red")),
-            Layout(Panel(system_feed, title="[bold yellow]System Events[/]", border_style="yellow"))
-        )
-        return screen_layout
+def paint_dashboard():
+    return render_scanner_dashboard(
+        ui_mutex,
+        pause_event,
+        scoreboard,
+        thread_dashboard,
+        len(API_SIGNATURES),
+        is_typing_url,
+        input_buffer,
+        log_history,
+        leak_history,
+        MAX_DOWNLOAD_SIZE_BYTES,
+    )
 
 def thread_runner(repo_data: dict):
     with tag_mutex:
@@ -671,6 +828,8 @@ def thread_runner(repo_data: dict):
 
     try:
         return dissect_repo_memory(repo_data, thread_tag)
+    except ScanInterrupted:
+        raise
     except Exception as e:
         safe_name = repo_data.get("name", "Unknown_Repo")
         log_dead_repo(safe_name, f"Critical Thread Crash", "-", 0.0)
@@ -683,10 +842,12 @@ def thread_runner(repo_data: dict):
                 available_thread_tags.append(thread_tag)
 
 def main():
-    global exit_prog, active_proxies, new_manual_targets
-    
-    if not SCAN_HEROKU_KEYS and "Heroku API Key" in API_SIGNATURES:
-        del API_SIGNATURES["Heroku API Key"]
+    global exit_prog, active_proxies
+    keyboard_thread = None
+    reset_runtime_state()
+    ensure_json_list_file(LEAKS_JSON)
+    ensure_json_list_file(DEAD_TARGETS_JSON)
+    ensure_json_list_file(BORING_REPOS_JSON)
 
     try:
         with open(QUEUE_JSON, "r", encoding="utf-8") as file_ptr:
@@ -703,20 +864,27 @@ def main():
     scoreboard["total"] = len(queued_targets)
     scoreboard["remaining"] = len(queued_targets)
     
-    threading.Thread(target=keyboard_monitor, daemon=True).start()
-    log_msg("[bold green]Scanner initiated. Press SPACE to Pause/Resume.[/]")
+    keyboard_thread = threading.Thread(target=keyboard_monitor, daemon=True)
+    keyboard_thread.start()
+    log_msg("[bold green]Scanner initiated. Press SPACE to Pause/Resume or I for AI target insertion.[/]")
 
     try:
         with Live(get_renderable=paint_dashboard, refresh_per_second=6, screen=True) as live_screen:
             with ThreadPoolExecutor(max_workers=MAX_THREADS) as thread_pool:
                 pending_tasks = set()
+                idle_shutdown_deadline = None
                 for target in queued_targets:
                     pending_tasks.add(thread_pool.submit(thread_runner, target))
                 
-                while pending_tasks or new_manual_targets:
-                    while new_manual_targets:
-                        new_t = new_manual_targets.pop(0)
+                while pending_tasks or has_manual_targets() or is_typing_url or idle_shutdown_deadline is not None:
+                    if exit_prog:
+                        break
+                    while True:
+                        new_t = pop_manual_target()
+                        if new_t is None:
+                            break
                         pending_tasks.add(thread_pool.submit(thread_runner, new_t))
+                        idle_shutdown_deadline = None
                         
                     if pending_tasks:
                         done_tasks, pending_tasks = wait(pending_tasks, timeout=0.25, return_when=FIRST_COMPLETED)
@@ -724,20 +892,58 @@ def main():
                         for finished_task in done_tasks:
                             try:
                                 task_outcome = finished_task.result()
+                                if task_outcome is None:
+                                    continue
                                 if task_outcome["status"] == "leaked": dump_json_safely(LEAKS_JSON, task_outcome)
                                 elif task_outcome["status"] == "failed": dump_json_safely(DEAD_TARGETS_JSON, task_outcome)
                                 elif task_outcome["status"] == "clean": dump_json_safely(BORING_REPOS_JSON, task_outcome)
                                     
                                 remove_from_queue(task_outcome.get("repo"))
                                 bump_score("remaining", -1)
-                            except Exception: pass
+                            except ScanInterrupted:
+                                continue
+                            except Exception:
+                                pass
                         
                         live_screen.update(paint_dashboard())
+                        if exit_prog:
+                            break
+                        if pending_tasks or has_manual_targets() or is_typing_url:
+                            idle_shutdown_deadline = None
+                        else:
+                            idle_shutdown_deadline = time.time() + 1.5
+                    else:
+                        if is_typing_url or has_manual_targets():
+                            idle_shutdown_deadline = None
+                            if not interruptible_sleep(0.1):
+                                break
+                        elif idle_shutdown_deadline is None:
+                            idle_shutdown_deadline = time.time() + 1.5
+                            log_msg("[bold yellow][!] Queue drained. Waiting briefly for AI target prompts...[/]")
+                            if not interruptible_sleep(0.1):
+                                break
+                        elif time.time() >= idle_shutdown_deadline:
+                            break
+                        else:
+                            if not interruptible_sleep(0.1):
+                                break
 
-        console.print("\n[bold green]Queue Exhausted. Scan Complete.[/]")
+        if exit_prog:
+            console.print("\n[bold yellow]Scanner stopped by user. Remaining targets stayed in the queue.[/]")
+        else:
+            console.print("\n[bold green]Queue Exhausted. Scan Complete.[/]")
+    except KeyboardInterrupt:
+        request_shutdown()
+        console.print("\n[bold yellow]Scanner stop requested. Waiting for active threads to unwind...[/]")
         
     finally:
         exit_prog = True
+        if pause_event is not None:
+            pause_event.set()
+        if keyboard_thread is not None:
+            keyboard_thread.join(timeout=1.0)
 
 if __name__ == "__main__":
+    install_signal_handlers()
+    apply_runtime_overrides(parse_args())
     main()

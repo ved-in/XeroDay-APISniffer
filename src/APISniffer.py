@@ -47,11 +47,14 @@
 
 
 
+import argparse
 import json
 import os
 import random
+import signal
 import time
 import sys
+import tempfile
 import requests
 from typing import List, Optional
 
@@ -63,7 +66,7 @@ from datetime import (
 
 
 
-LOOKBACK_MINS = 4     # 20 mins for now is enough unless you need bigger dataset
+LOOKBACK_MINS = 1     # 20 mins for now is enough unless you need bigger dataset
 CHUNK_MINS = 1        # Time-slice per chunk
 TARGET_QUEUE_FILE = "recent_repos.json"
 PROXY_FILE = "live_proxies.txt"
@@ -77,6 +80,29 @@ MAX_SPLIT_DEPTH = 10
 SCANNED_HISTORY = ["clean_repos.json", "failed_repos.json", "leaked_keys.json"]
 
 SPOOFED_UA = "XeroDay-APISniffer/1.0"
+shutdown_requested = False
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Discover recent GitHub repositories.")
+    parser.add_argument("--lookback-mins", type=int, help="How far back to search for repositories.")
+    parser.add_argument("--chunk-mins", type=int, help="Time window per query chunk.")
+    parser.add_argument("--pages-to-scrape", type=int, help="Maximum GitHub result pages to fetch per chunk.")
+    parser.add_argument("--proxy-retry-limit", type=int, help="Maximum proxies to try before giving up.")
+    return parser.parse_args()
+
+
+def apply_runtime_overrides(args) -> None:
+    global LOOKBACK_MINS, CHUNK_MINS, PAGES_TO_SCRAPE, PROXY_RETRY_LIMIT
+
+    if args.lookback_mins is not None:
+        LOOKBACK_MINS = max(1, args.lookback_mins)
+    if args.chunk_mins is not None:
+        CHUNK_MINS = max(1, args.chunk_mins)
+    if args.pages_to_scrape is not None:
+        PAGES_TO_SCRAPE = max(1, args.pages_to_scrape)
+    if args.proxy_retry_limit is not None:
+        PROXY_RETRY_LIMIT = max(1, args.proxy_retry_limit)
 
 
 def grab_proxies(filepath: str = PROXY_FILE) -> List[str]:
@@ -104,11 +130,63 @@ def format_proxy_dict(ip_port: str) -> dict:
     return {"http": f"http://{ip_port}", "https": f"http://{ip_port}"}
 
 
+def request_shutdown(_signum, _frame) -> None:
+    global shutdown_requested
+    if shutdown_requested:
+        raise KeyboardInterrupt
+    shutdown_requested = True
+    print(
+        "\n[!] Ctrl+C received. Stopping after the current request. "
+        "Anything already written to recent_repos.json is safe.",
+        flush=True,
+    )
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, request_shutdown)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_shutdown)
+
+
+def interruptible_sleep(seconds: float) -> bool:
+    deadline = time.time() + max(0.0, seconds)
+    while time.time() < deadline:
+        if shutdown_requested:
+            return False
+        time.sleep(min(0.1, deadline - time.time()))
+    return not shutdown_requested
+
+
+def write_json_snapshot(payload: list, filename: str) -> None:
+    directory = os.path.dirname(os.path.abspath(filename)) or "."
+    file_prefix = f".{os.path.basename(filename)}."
+    file_descriptor, temp_path = tempfile.mkstemp(prefix=file_prefix, suffix=".tmp", dir=directory)
+
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file_ptr:
+            json.dump(payload, file_ptr, indent=4)
+            file_ptr.flush()
+            os.fsync(file_ptr.fileno())
+        os.replace(temp_path, filename)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def ensure_json_list_file(filename: str) -> None:
+    if os.path.exists(filename):
+        return
+    write_json_snapshot([], filename)
+
+
 
 
 def make_request(
     session_obj: requests.Session, endpoint: str, query: dict, ips: List[str]
 ) -> requests.Response:
+    if shutdown_requested:
+        raise KeyboardInterrupt
+
     browser_headers = {"User-Agent": SPOOFED_UA}
 
     # Try with our real IP first
@@ -151,10 +229,12 @@ def make_request(
                 print(f"[+] Success using proxy: {ip}")
                 return r
             print(f"[-] Proxy {ip} hit status {r.status_code}. Skipping...")
-            time.sleep(0.25)
+            if not interruptible_sleep(0.25):
+                raise KeyboardInterrupt
         except requests.RequestException as e:
             last_error = e
-            time.sleep(0.15)
+            if not interruptible_sleep(0.15):
+                raise KeyboardInterrupt
             continue
 
     if req is not None:
@@ -209,9 +289,7 @@ def sync_results_to_disk(raw_json: dict, filename: str = TARGET_QUEUE_FILE):
             new_finds += 1
 
     current_queue.sort(key=lambda x: x["created_at"], reverse=True)
-
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(current_queue, f, indent=4)
+    write_json_snapshot(current_queue, filename)
 
     return new_finds
 
@@ -220,6 +298,10 @@ def sync_results_to_disk(raw_json: dict, filename: str = TARGET_QUEUE_FILE):
 
 
 def main():
+    global shutdown_requested
+    shutdown_requested = False
+    ensure_json_list_file(TARGET_QUEUE_FILE)
+
     api_url = "https://api.github.com/search/repositories"
     proxies = grab_proxies()
 
@@ -232,6 +314,7 @@ def main():
 
     http_session = requests.Session()
     total_new_finds = 0
+    interrupted = False
 
     try:
         now = datetime.now(timezone.utc)
@@ -252,6 +335,10 @@ def main():
 
         chunk_idx = 0
         while chunks:
+            if shutdown_requested:
+                interrupted = True
+                break
+
             start_time, end_time = chunks.pop(0)
             chunk_idx += 1
             
@@ -301,11 +388,13 @@ def main():
             total_new_finds += saved_this_chunk
             print(f"  -> Siphoned Page 1/{pages_needed}: +{saved_this_chunk} fresh targets")
 
-            if len(found_repos) < RESULTS_PER_PAGE:
-                continue
-
             for page_num in range(2, pages_needed + 1):
-                time.sleep(2)
+                if shutdown_requested:
+                    interrupted = True
+                    break
+                if not interruptible_sleep(2):
+                    interrupted = True
+                    break
 
                 api_query = get_search_query(start_time, end_time, page=page_num)
                 print(f"  -> Fetching Page {page_num}/{pages_needed}...")
@@ -330,17 +419,29 @@ def main():
                 total_new_finds += loot
                 print(f"     +{loot} fresh targets")
 
-                if len(current_items) < RESULTS_PER_PAGE:
-                    break
+                if len(current_items) < RESULTS_PER_PAGE and page_num < pages_needed:
+                    print(
+                        f"  [!] Page {page_num} returned only {len(current_items)} results, "
+                        "but GitHub reported more pages. Continuing anyway..."
+                    )
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n[!] Discovery interrupted by user. Recent results already saved to disk.", flush=True)
 
     finally:
         http_session.close()
 
     print(f"\n{'='*60}")
-    print(f"[+] Done! Successfully added {total_new_finds} total new targets to the queue.")
+    if interrupted or shutdown_requested:
+        print(f"[!] Stopped early. Saved {total_new_finds} new targets to the queue so far.")
+    else:
+        print(f"[+] Done! Successfully added {total_new_finds} total new targets to the queue.")
 
 
 
 
 if __name__ == "__main__":
+    install_signal_handlers()
+    apply_runtime_overrides(parse_args())
     main()
