@@ -1,8 +1,8 @@
-import json
 import re
 from typing import Callable, List, Optional
 
-import requests
+from .ai_client import ask_json
+from .ai_policy import load_pol
 
 
 GITHUB_REPO_URL_PATTERN = re.compile(
@@ -15,32 +15,6 @@ GITHUB_REPO_NAME_PATTERN = re.compile(
 GITHUB_REPO_FULL_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 REPO_CONTEXT_TERMS = ("github", "repo", "repository", "repositories")
 REPO_BATCH_IGNORED_TOKENS = {"and"}
-AI_REPO_TARGET_PROMPT = '''You extract GitHub repository targets for an automated security scanner.
-Return valid JSON only in this exact format:
-{
-  "understanding": "short summary",
-  "targets": ["owner/repo", "owner/another-repo"]
-}
-
-Rules:
-1. Capture every GitHub repository target present in the user's text.
-2. Support pasted GitHub URLs, multiple URLs in one message, bare owner/repo names, and repo subpaths by reducing them to owner/repo.
-3. Deduplicate exact duplicates.
-4. Ignore non-GitHub links and text that does not point to a repository.
-5. Do not invent repositories that are not present in the input.
-6. If there are no valid repositories, return an empty targets array.
-'''
-
-# This is used to salvage the JSON payload when the model wraps it in extra text.
-def extract_json_blob(raw_text: str) -> dict:
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(raw_text[start:end + 1])
-        raise
 
 
 def repo_identity(repo_name: str) -> str:
@@ -147,34 +121,28 @@ def extract_repo_targets_regex(prompt_text: str) -> List[dict]:
 def extract_repo_targets_with_ai(
     prompt_text: str,
     groq_api_key: str,
-    api_url: str,
-    model: str,
-    timeout: int,
+    pol: Optional[dict],
     log_message: Callable[[str], None],
 ) -> List[dict]:
     if not groq_api_key:
         log_message("[bold yellow][!] GROQ_API_KEY not set. Using direct GitHub target extraction only.[/]")
         return []
 
-    headers = {
-        "Authorization": f"Bearer {groq_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": AI_REPO_TARGET_PROMPT},
-            {"role": "user", "content": prompt_text},
-        ],
-        "temperature": 0,
-    }
+    pol = pol or load_pol(log_fn=log_message)
+    if not pol:
+        return []
+
+    sys_txt = str(pol.get("repo_targets", {}).get("system", "")).strip()
+    if not sys_txt:
+        log_message("[bold red][!] AI repo-target policy missing.[/]")
+        return []
 
     try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
-        response.raise_for_status()
-        response_data = response.json()
-        ai_payload = extract_json_blob(response_data["choices"][0]["message"]["content"])
+        msgs = [
+            {"role": "system", "content": sys_txt},
+            {"role": "user", "content": prompt_text},
+        ]
+        ai_payload = ask_json(msgs, groq_api_key, pol.get("llm", {}))
     except Exception as exc:
         log_message(f"[bold red][!] AI target extraction failed:[/] {exc}")
         return []
@@ -199,11 +167,9 @@ def extract_repo_targets_with_ai(
 def resolve_repo_targets(
     prompt_text: str,
     groq_api_key: str,
-    api_url: str,
-    model: str,
-    timeout: int,
+    pol: Optional[dict],
     log_message: Callable[[str], None],
 ) -> List[dict]:
-    ai_targets = extract_repo_targets_with_ai(prompt_text, groq_api_key, api_url, model, timeout, log_message)
+    ai_targets = extract_repo_targets_with_ai(prompt_text, groq_api_key, pol, log_message)
     regex_targets = extract_repo_targets_regex(prompt_text)
     return dedupe_repo_targets([*ai_targets, *regex_targets])

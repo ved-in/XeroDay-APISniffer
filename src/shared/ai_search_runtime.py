@@ -3,25 +3,20 @@ import os
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+from .ai_client import ask_json, ask_text, get_key
+from .ai_policy import fill_tpl, load_pol
 from .api_signatures import API_SIGNATURE_CATEGORIES
 from .category_routing import infer_categories_from_query, is_summary_query, normalize_categories
 
 
 LEAKS_JSON = "leaked_keys.json"
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
 AVAILABLE_CATEGORIES = list(API_SIGNATURE_CATEGORIES)
-DEFAULT_RESULT_LIMIT = 50
-MAX_RESULT_LIMIT = 100
 AI_PREVIEW_LIMIT = 10
-VALID_INTENTS = {"search", "summary"}
-VALID_ORIGINS = {"any", "commit", "repo_file"}
 
 
 def count_unique_repositories(entries: list) -> int:
@@ -54,12 +49,7 @@ def render_header(console: Console) -> None:
 
 
 def get_groq_api_key(console: Console) -> str:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        console.print("[bold yellow][!] GROQ_API_KEY environment variable not found.[/]")
-        api_key = Prompt.ask("[bold cyan]Please enter your Groq API Key (gsk_...)[/]", password=True, console=console)
-        os.environ["GROQ_API_KEY"] = api_key
-    return api_key
+    return get_key(console)
 
 
 def load_database(console: Console) -> list:
@@ -84,17 +74,6 @@ def render_database_overview(console: Console, db_data: list) -> None:
     console.print(f"[green]Loaded database with {repo_count} repositories and {total_findings} findings.[/]")
 
 
-def extract_json_blob(raw_text: str) -> Dict[str, object]:
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(raw_text[start : end + 1])
-        raise
-
-
 def normalize_terms(raw_terms: Any) -> List[str]:
     if not isinstance(raw_terms, list):
         return []
@@ -113,18 +92,35 @@ def normalize_terms(raw_terms: Any) -> List[str]:
     return cleaned_terms
 
 
-def clamp_limit(raw_value: Any, default: int = DEFAULT_RESULT_LIMIT) -> int:
+def clamp_limit(raw_value: Any, default: int, max_limit: int) -> int:
     try:
         limit_value = int(raw_value)
     except (TypeError, ValueError):
         return default
-    return max(1, min(MAX_RESULT_LIMIT, limit_value))
+    return max(1, min(max_limit, limit_value))
 
 
-def normalize_query_plan(ai_instructions: dict) -> Dict[str, object]:
+def _q_cfg(pol: Dict[str, Any]) -> Dict[str, Any]:
+    q = pol.get("query", {}) if isinstance(pol, dict) else {}
+    lim = q.get("limit", {}) if isinstance(q, dict) else {}
+    intents = q.get("valid_intents") or ["search", "summary"]
+    origins = q.get("valid_origins") or ["any", "commit", "repo_file"]
+    lim_def = int(lim.get("default", 50) or 50)
+    lim_max = int(lim.get("max", 100) or 100)
+    return {
+        "intents": {str(x).strip().lower() for x in intents if str(x).strip()},
+        "origins": {str(x).strip().lower() for x in origins if str(x).strip()},
+        "lim_def": lim_def,
+        "lim_max": lim_max,
+        "sys": str(q.get("system", "")).strip(),
+    }
+
+
+def normalize_query_plan(ai_instructions: dict, pol: Dict[str, Any]) -> Dict[str, object]:
+    cfg = _q_cfg(pol)
     understanding = str(ai_instructions.get("understanding", "")).strip() if isinstance(ai_instructions, dict) else ""
     intent = str(ai_instructions.get("intent", "search")).strip().lower() if isinstance(ai_instructions, dict) else "search"
-    if intent not in VALID_INTENTS:
+    if intent not in cfg["intents"]:
         intent = "search"
 
     raw_categories = ai_instructions.get("target_categories", []) if isinstance(ai_instructions, dict) else []
@@ -132,7 +128,7 @@ def normalize_query_plan(ai_instructions: dict) -> Dict[str, object]:
         raw_categories = []
 
     origin = str(ai_instructions.get("origin", "any")).strip().lower() if isinstance(ai_instructions, dict) else "any"
-    if origin not in VALID_ORIGINS:
+    if origin not in cfg["origins"]:
         origin = "any"
 
     return {
@@ -142,11 +138,16 @@ def normalize_query_plan(ai_instructions: dict) -> Dict[str, object]:
         "repo_terms": normalize_terms(ai_instructions.get("repo_terms", []) if isinstance(ai_instructions, dict) else []),
         "file_terms": normalize_terms(ai_instructions.get("file_terms", []) if isinstance(ai_instructions, dict) else []),
         "origin": origin,
-        "limit": clamp_limit(ai_instructions.get("limit", DEFAULT_RESULT_LIMIT) if isinstance(ai_instructions, dict) else DEFAULT_RESULT_LIMIT),
+        "limit": clamp_limit(
+            ai_instructions.get("limit", cfg["lim_def"]) if isinstance(ai_instructions, dict) else cfg["lim_def"],
+            cfg["lim_def"],
+            cfg["lim_max"],
+        ),
     }
 
 
-def build_fallback_query_plan(user_query: str) -> Dict[str, object]:
+def build_fallback_query_plan(user_query: str, pol: Dict[str, Any]) -> Dict[str, object]:
+    cfg = _q_cfg(pol)
     return {
         "understanding": "",
         "intent": "summary" if is_summary_query(user_query) else "search",
@@ -154,77 +155,28 @@ def build_fallback_query_plan(user_query: str) -> Dict[str, object]:
         "repo_terms": [],
         "file_terms": [],
         "origin": "any",
-        "limit": DEFAULT_RESULT_LIMIT,
+        "limit": cfg["lim_def"],
     }
 
 
-def ask_ai_for_query_plan(user_query: str, api_key: str) -> dict:
-    system_prompt = f"""You are X3r0Day's API Sniffer's AI query planner.
-Your job is to convert the user's request into a structured search plan for leaked_keys.json.
-You must return valid JSON only.
-
-Database shape:
-- top-level JSON list
-- each item looks like:
-  {{
-    "repo": "owner/repo",
-    "findings": [
-      {{
-        "type": "Exact Category Name",
-        "secret": "raw secret value",
-        "file": "path/to/file" or "Commit abc123",
-        "line": 12
-      }}
+def ask_ai_for_query_plan(user_query: str, api_key: str, pol: Dict[str, Any]) -> dict:
+    cfg = _q_cfg(pol)
+    rep = {
+        "__CATEGORIES__": json.dumps(AVAILABLE_CATEGORIES),
+        "__VALID_INTENTS__": json.dumps(sorted(cfg["intents"])),
+        "__VALID_ORIGINS__": json.dumps(sorted(cfg["origins"])),
+        "__LIMIT_DEFAULT__": str(cfg["lim_def"]),
+    }
+    sys_tpl = cfg["sys"]
+    if not sys_tpl:
+        raise RuntimeError("AI query policy missing.")
+    sys_txt = fill_tpl(sys_tpl, rep)
+    msgs = [
+        {"role": "system", "content": sys_txt},
+        {"role": "user", "content": user_query},
     ]
-  }}
-
-AVAILABLE EXACT CATEGORIES:
-{json.dumps(AVAILABLE_CATEGORIES)}
-
-Return this exact JSON shape:
-{{
-  "understanding": "One short sentence describing what will be searched.",
-  "intent": "search",
-  "target_categories": ["Exact Category Name"],
-  "repo_terms": ["substring from the user's request"],
-  "file_terms": ["substring from the user's request"],
-  "origin": "any",
-  "limit": 50
-}}
-
-Rules:
-1. Use ONLY exact category names from AVAILABLE EXACT CATEGORIES.
-2. If the user asks about all findings or does not constrain a category, leave target_categories empty.
-3. Put repo_terms and file_terms only when the user clearly specifies them.
-4. origin must be one of:
-   - "any"
-   - "commit" when the user asks about commits, commit history, or patches
-   - "repo_file" when the user explicitly asks about files rather than commits
-5. intent must be:
-   - "search" for detailed matches
-   - "summary" for counts, statistics, overview, category lists, or broad summaries
-6. Do not invent categories, repo names, file paths, or facts not implied by the request.
-7. limit should be a reasonable row cap based on the request. Use 50 if unspecified.
-"""
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query},
-        ],
-        "temperature": 0.1,
-    }
-
-    response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    return extract_json_blob(data["choices"][0]["message"]["content"])
+    cfg_llm = pol.get("llm", {})
+    return ask_json(msgs, api_key, cfg_llm)
 
 
 def mask_secret(secret_value: str) -> str:
@@ -255,7 +207,7 @@ def build_scope_text(query_plan: Dict[str, object]) -> str:
     elif origin == "repo_file":
         scope_parts.append("origin=repository files")
 
-    scope_parts.append(f"limit={query_plan.get('limit', DEFAULT_RESULT_LIMIT)}")
+    scope_parts.append(f"limit={query_plan.get('limit', 50)}")
     return "; ".join(scope_parts)
 
 
@@ -343,37 +295,28 @@ def build_result_context(query_plan: Dict[str, object], matches: List[Dict[str, 
     }
 
 
-def ask_ai_for_result_summary(user_query: str, query_plan: Dict[str, object], matches: List[Dict[str, str]], api_key: str) -> str:
-    system_prompt = """You explain search results from a local leaked-secrets database.
-Reply in 1 or 2 short sentences.
-Do not invent anything that is not in the result context.
-If there are zero results, say that clearly.
-Do not print or reconstruct full secret values from previews.
-"""
+def ask_ai_for_result_summary(
+    user_query: str,
+    query_plan: Dict[str, object],
+    matches: List[Dict[str, str]],
+    api_key: str,
+    pol: Dict[str, Any],
+) -> str:
+    sys_txt = str(pol.get("summary", {}).get("system", "")).strip()
+    if not sys_txt:
+        raise RuntimeError("AI summary policy missing.")
 
     user_payload = {
         "user_query": user_query,
         "query_plan": query_plan,
         "result_context": build_result_context(query_plan, matches),
     }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload)},
-        ],
-        "temperature": 0.2,
-    }
-
-    response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
-    response.raise_for_status()
-    response_data = response.json()
-    return str(response_data["choices"][0]["message"]["content"]).strip()
+    msgs = [
+        {"role": "system", "content": sys_txt},
+        {"role": "user", "content": json.dumps(user_payload)},
+    ]
+    cfg_llm = pol.get("llm", {})
+    return ask_text(msgs, api_key, cfg_llm)
 
 
 def fallback_summary_text(user_query: str, query_plan: Dict[str, object], matches: List[Dict[str, str]]) -> str:
@@ -407,7 +350,7 @@ def search_and_display(query_plan: Dict[str, object], matches: List[Dict[str, st
     table.add_column("Secret / Key", style="red", overflow="fold", ratio=4)
     table.add_column("File / Origin", style="dim", overflow="fold", ratio=2)
 
-    limited_matches = matches[: int(query_plan.get("limit", DEFAULT_RESULT_LIMIT))]
+    limited_matches = matches[: int(query_plan.get("limit", 50))]
     for match in limited_matches:
         table.add_row(match["repo"], match["type"], match["secret"], match["file"])
 
@@ -463,19 +406,19 @@ def display_summary(query_plan: Dict[str, object], matches: List[Dict[str, str]]
     console.print()
 
 
-def process_query(cleaned_input: str, api_key: str, db_data: list, console: Console) -> None:
+def process_query(cleaned_input: str, api_key: str, db_data: list, console: Console, pol: Dict[str, Any]) -> None:
     with console.status("[bold yellow]AI is planning the search...[/]", spinner="dots"):
         try:
-            query_plan = normalize_query_plan(ask_ai_for_query_plan(cleaned_input, api_key))
+            query_plan = normalize_query_plan(ask_ai_for_query_plan(cleaned_input, api_key, pol), pol)
         except Exception as error:
             console.print(f"[bold yellow][!] AI planner fallback engaged: {error}[/]")
-            query_plan = build_fallback_query_plan(cleaned_input)
+            query_plan = build_fallback_query_plan(cleaned_input, pol)
 
     matches = collect_matches(query_plan, db_data)
 
     with console.status("[bold yellow]AI is analyzing the results...[/]", spinner="dots"):
         try:
-            ai_summary = ask_ai_for_result_summary(cleaned_input, query_plan, matches, api_key)
+            ai_summary = ask_ai_for_result_summary(cleaned_input, query_plan, matches, api_key, pol)
         except Exception as error:
             console.print(f"[bold yellow][!] AI summary fallback engaged: {error}[/]")
             ai_summary = ""
@@ -504,6 +447,10 @@ def run_single_query(
     if show_header:
         render_header(active_console)
 
+    pol = load_pol(log_fn=active_console.print)
+    if not pol:
+        return
+
     resolved_api_key = api_key or get_groq_api_key(active_console)
     db_data = load_database(active_console)
     if not db_data:
@@ -512,12 +459,16 @@ def run_single_query(
     if show_header:
         render_database_overview(active_console, db_data)
 
-    process_query(cleaned_query, resolved_api_key, db_data, active_console)
+    process_query(cleaned_query, resolved_api_key, db_data, active_console, pol)
 
 
 def run_interactive_search(console: Optional[Console] = None) -> None:
     active_console = console or Console()
     render_header(active_console)
+
+    pol = load_pol(log_fn=active_console.print)
+    if not pol:
+        return
 
     api_key = get_groq_api_key(active_console)
     db_data = load_database(active_console)
@@ -538,7 +489,7 @@ def run_interactive_search(console: Optional[Console] = None) -> None:
                 active_console.print("[bold magenta]Shutting down AI Engine...[/]")
                 break
 
-            process_query(cleaned_input, api_key, db_data, active_console)
+            process_query(cleaned_input, api_key, db_data, active_console, pol)
         except KeyboardInterrupt:
             active_console.print("\n[bold magenta]Shutting down AI Engine...[/]")
             break

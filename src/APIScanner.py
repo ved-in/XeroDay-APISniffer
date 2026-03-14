@@ -61,6 +61,7 @@ from shared.api_signatures import build_api_signatures
 from shared.scanner_dashboard import paint_dashboard as render_scanner_dashboard
 from shared.scanner_matcher import regex_grep_text as grep_scanner_text
 from shared.scanner_targets import resolve_repo_targets as resolve_scanner_targets
+from shared.ai_policy import load_pol
 
 
 QUEUE_JSON = "recent_repos.json"
@@ -89,15 +90,14 @@ TARGET_EXTENSIONS = (
     ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yml", ".yaml", ".xml", 
     ".txt", ".env", ".ini", ".conf", ".config", ".sh", ".bash", ".php", 
     ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".go", ".rb", ".swift", 
-    ".kt", ".kts", ".rs", ".sql", ".md", ".toml", ".properties"
+    ".kt", ".kts", ".rs", ".sql", ".md", ".toml", ".properties", "tfvars",
+    ".tf", ".hcl", ".gradle", ".plist", ".cfg", ".envrc", ".lua", ".dart",
+    ".zsh", ".fish", ".bat", ".cmd", ".psm1", "ps1"
 )
 EXACT_FILENAMES = ("dockerfile", "makefile", "gemfile")
 
 # This user agent is used because GitHub was less likely to return 403 for archive requests.
 SPOOFED_USER_AGENT = "Wget/1.21.2"
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-AI_TARGET_REQUEST_TIMEOUT = 15
 
 API_SIGNATURES = build_api_signatures(include_heroku=SCAN_HEROKU_KEYS)
 
@@ -124,6 +124,7 @@ fail_history = deque(maxlen=10)
 leak_history = deque(maxlen=10)
 scoreboard = {"total": 0, "scanned": 0, "leaks": 0, "clean": 0, "failed": 0, "remaining": 0}
 manual_target_mutex = threading.Lock()
+AI_POL = None
 
 
 class ScanInterrupted(Exception):
@@ -404,12 +405,13 @@ def repo_identity(repo_name: str) -> str:
     return (repo_name or "").strip().lower()
 
 def resolve_repo_targets(prompt_text: str) -> List[dict]:
+    global AI_POL
+    if AI_POL is None:
+        AI_POL = load_pol(log_fn=log_msg)
     return resolve_scanner_targets(
         prompt_text,
         os.environ.get("GROQ_API_KEY", "").strip(),
-        GROQ_API_URL,
-        GROQ_MODEL,
-        AI_TARGET_REQUEST_TIMEOUT,
+        AI_POL,
         log_msg,
     )
 
@@ -842,9 +844,10 @@ def thread_runner(repo_data: dict):
                 available_thread_tags.append(thread_tag)
 
 def main():
-    global exit_prog, active_proxies
+    global exit_prog, active_proxies, AI_POL
     keyboard_thread = None
     reset_runtime_state()
+    AI_POL = load_pol(log_fn=console.print)
     ensure_json_list_file(LEAKS_JSON)
     ensure_json_list_file(DEAD_TARGETS_JSON)
     ensure_json_list_file(BORING_REPOS_JSON)
