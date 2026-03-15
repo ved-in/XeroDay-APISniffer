@@ -2,7 +2,7 @@
 
 API Sniffer is a GitHub-focused secret discovery toolkit for scanning public repositories and identifying exposed API keys, tokens, webhooks, and other sensitive credentials. It is part of the X3r0Day Framework and is built for security research, defensive analysis, and responsible disclosure.
 
-The project is organized around discovery, scanning, and querying, with an AI-first launcher, a workflow orchestrator, shared routing and search utilities, scanner dashboard helpers, repo-target extraction helpers.
+The project is organized around discovery, scanning, and querying, with an AI-first launcher, a workflow orchestrator, shared routing/search utilities, and a live scanner dashboard.
 
 ---
 
@@ -10,8 +10,8 @@ The project is organized around discovery, scanning, and querying, with an AI-fi
 
 API Sniffer supports two operating modes:
 
-1. **AI-first launch path** through `main.py` -> `AIWorkflow.py`, where natural-language requests are routed into discovery, scanning, direct database querying, or chained workflows.
-2. **Manual stage execution** where you run the modules yourself or use the numbered launcher menu.
+1. **AI workflow orchestration** via `AIWorkflow.py`, where natural-language requests are routed into discovery, scanning, direct database querying, or chained workflows.
+2. **Manual execution** via `main.py`, which exposes a control center for running each stage or the full pipeline.
 
 The core pipeline is:
 
@@ -20,8 +20,6 @@ The core pipeline is:
 **Stage 2 - Scanning (`APIScanner.py`)**: Pulls repositories from the queue, resolves the repo's default branch when needed, downloads repository archives, scans matching files, optionally scans recent commit patches, and writes results into `leaked_keys.json`, `clean_repos.json`, or `failed_repos.json`.
 
 **Stage 3 - AI Search (`AISearch.py`)**: Queries the local findings database with natural language. The search runtime is shared with the AI workflow, so database questions like `show all the API keys` can be answered directly from the launcher flow.
-
-**Shared runtime modules (`src/shared/`)**: Hold reusable logic for API signature definitions, category routing, AI-assisted search, scanner matching, scanner dashboard rendering, and GitHub repo target extraction.
 
 ### Project Flow
 
@@ -43,11 +41,47 @@ main.py
 
 ---
 
+## Components
+
+- **`APISniffer.py` (Discovery)**
+  - Queries GitHub search for newly created public repos.
+  - Uses a time-windowed, chunked search with adaptive splitting for high-volume windows.
+  - Deduplicates against historical outputs and the live queue.
+  - Supports proxy fallback via `live_proxies.txt` when direct requests fail or rate-limit.
+
+- **`APIScanner.py` (Scanner)**
+  - Pulls targets from `recent_repos.json` and scans repository archives.
+  - Filters by file extension and filename to reduce noise.
+  - Optionally scans recent commit history (patches) to catch secrets removed after commit.
+  - Provides a live Rich-based dashboard with queue stats, thread status, and recent leaks.
+  - Supports interactive repo injection during runtime (AI-assisted or regex-based).
+
+- **`AISearch.py` + `shared/ai_search_runtime.py` (AI Query Engine)**
+  - Uses Groq's OpenAI-compatible API to interpret natural-language queries.
+  - Plans category/term filters, searches `leaked_keys.json`, and returns results.
+  - Supports summary mode (counts and top categories) and full search results.
+
+- **Shared Utilities (`src/shared/`)**
+  - `ai_client.py`: Groq API calls and key handling (`GROQ_API_KEY`).
+  - `ai_policy.py`: Loads policy from `config/ai_policy.json` and supports overrides.
+  - `ai_search_runtime.py`: Query planning, filtering, and result rendering.
+  - `api_signatures.py` + `signature_loader.py`: Data-driven signature loading from `data/signatures.json`.
+  - `category_routing.py`: Maps user queries to signature categories.
+  - `scanner_matcher.py`: Regex matching + normalization (e.g., Firebase URL expansion).
+  - `scanner_targets.py`: Repo target extraction (regex + AI assist).
+  - `scanner_dashboard.py`: Live scanner dashboard layout.
+
+---
+
 ## Project Structure
 
 ```text
 API Sniffer/
-├── main.py                         # Control center entry point
+├── main.py                         # Control center launcher
+├── config/
+│   └── ai_policy.json              # AI routing + model config
+├── data/
+│   └── signatures.json             # Signature definitions (regex + tags)
 ├── src/
 │   ├── APISniffer.py               # Stage 1: GitHub repository discovery
 │   ├── APIScanner.py               # Stage 2: Repository scanning and secret detection
@@ -55,12 +89,15 @@ API Sniffer/
 │   ├── AIWorkflow.py               # AI workflow router and stage orchestrator
 │   └── shared/
 │       ├── __init__.py
+│       ├── ai_client.py            # Groq API client + key handling
+│       ├── ai_policy.py            # AI policy loader + templates
 │       ├── ai_search_runtime.py    # Shared AI query runtime used by AISearch and AIWorkflow
-│       ├── api_signatures.py       # Secret signature definitions
+│       ├── api_signatures.py       # API signature loader entry point
 │       ├── category_routing.py     # Query/category inference helpers
 │       ├── scanner_dashboard.py    # Dashboard rendering for the scanner
 │       ├── scanner_matcher.py      # Regex matching and finding extraction
-│       └── scanner_targets.py      # Repo target extraction from prompts/URLs
+│       ├── scanner_targets.py      # Repo target extraction from prompts/URLs
+│       └── signature_loader.py     # Loads signatures.json -> compiled regex
 ├── requirements.txt
 ├── live_proxies.txt                # Optional proxy list to bypass rate limits
 └── README.md
@@ -94,9 +131,7 @@ pip install -r requirements.txt
 
 ---
 
-## Execution Order
-
-The modules can run one by one, and the launcher provides the fastest path through the full workflow.
+## Usage
 
 ### Unified Launcher (Recommended)
 
@@ -106,9 +141,9 @@ python main.py
 
 This opens the launcher. From there:
 
+- Press `Enter` to launch the AI workflow directly OR,
+- Type `Manual` to open the numbered control center OR,
 - Type `help` to see how the workflow works
-- Type `Manual` to open the numbered control center
-- Press `Enter` to open the AI workflow directly
 
 Example requests:
 
@@ -117,13 +152,30 @@ Example requests:
 - `start scanning`
 - `run discovery for last 3 minutes, then scan`
 
+### AI Workflow Orchestrator
+
+```bash
+python src/AIWorkflow.py
+```
+
+This prompts for a natural-language request, routes it using `config/ai_policy.json`, and runs the required stages in sequence. It uses Groq's OpenAI-compatible API (default model is configured in `config/ai_policy.json`).
+
 ### Stage 1: Discover Repositories
 
 ```bash
 python src/APISniffer.py
 ```
 
-This queries GitHub for recently created repositories and writes fresh entries to `recent_repos.json`. Discovery also skips repositories that already exist in the queue or in the historical output files (`clean_repos.json`, `failed_repos.json`, and `leaked_keys.json`). If your IP gets rate-limited, it can fall back to proxies from `live_proxies.txt`.
+CLI flags:
+
+```text
+--lookback-mins
+--chunk-mins
+--pages-to-scrape
+--proxy-retry-limit
+```
+
+Discovery queries GitHub for recently created repositories and writes fresh entries to `recent_repos.json`. It skips repositories already present in `clean_repos.json`, `failed_repos.json`, or `leaked_keys.json`. If your IP gets rate-limited, it can fall back to proxies from `live_proxies.txt`.
 
 ### Stage 2: Scan for Leaked Secrets
 
@@ -131,13 +183,22 @@ This queries GitHub for recently created repositories and writes fresh entries t
 python src/APIScanner.py
 ```
 
-This reads from `recent_repos.json`, resolves the repository's default branch when possible, downloads each repository as a ZIP archive, and scans it against the supported secret signatures. It can also inspect recent commit patches. Results are written to `leaked_keys.json`, `clean_repos.json`, or `failed_repos.json`. Scanned repositories are removed from the queue.
+CLI flags:
 
-The scanner opens a full-screen terminal dashboard.
+```text
+--max-threads
+--history-depth
+--scan-heroku-keys
+--no-commit-history
+--prefer-proxy
+```
 
-- Press `Space` to pause or resume
-- Press `i` to insert to ask AI to insert GitHub repo targets while the scanner is running
-- Repo insertion accepts GitHub URLs or `owner/repo` targets and pushes them into the live queue or just AI query
+The scanner reads from `recent_repos.json`, resolves the repository's default branch when possible, downloads each repository as a ZIP archive, and scans it against the supported secret signatures. It can also inspect recent commit patches. Results are written to `leaked_keys.json`, `clean_repos.json`, or `failed_repos.json`. Scanned repositories are removed from the queue.
+
+**Scanner controls:**
+- `Space`: Pause/resume scanning
+- `i`: Enter AI-assisted repo insertion mode
+- `Esc`: Cancel repo insertion input
 
 ### Stage 3: Query the Database
 
@@ -145,19 +206,11 @@ The scanner opens a full-screen terminal dashboard.
 python src/AISearch.py
 ```
 
-This opens the AI search prompt for the local database. It requires a Groq API key, which can be set through `GROQ_API_KEY` or entered at runtime.
-
-You can also run a one-shot query without opening the interactive prompt:
+One-shot query:
 
 ```bash
 python src/AISearch.py --query "Show all AWS keys"
 ```
-
-Example queries:
-
-- `Show me all AWS keys`
-- `Find any Discord tokens`
-- `List all AI-related API keys`
 
 ---
 
@@ -177,7 +230,9 @@ Proxies are used as a fallback when direct GitHub requests are rate-limited or b
 
 ## Supported API Key Signatures
 
-The signature set includes:
+Signature rules are data-driven and loaded from `data/signatures.json`. You can add or update patterns there and they will be picked up automatically.
+
+Examples of supported categories include:
 
 | Category | Examples |
 |---|---|
@@ -195,21 +250,78 @@ The signature set includes:
 
 ## Configuration
 
-Key values can be adjusted by editing the constants at the top of the scripts.
+- `GROQ_API_KEY`: Required for AI workflow routing and AI search. If not set, the tools will prompt for it.
+- `AI_POLICY_PATH`: Optional. Overrides the default policy path (`config/ai_policy.json`).
 
-**APISniffer.py**
-- `LOOKBACK_MINS` - How far back to search for new repositories
-- `CHUNK_MINS` - Time window size used per GitHub search chunk
-- `PAGES_TO_SCRAPE` - Number of GitHub API result pages to fetch
-- `PROXY_RETRY_LIMIT` - Maximum number of proxies to try before giving up
+**`config/ai_policy.json`**
+- Defines the Groq API endpoint, model name, and temperature settings.
+- Controls workflow routing rules and the AI query planner behavior.
 
-**APIScanner.py**
-- `MAX_THREADS` - Number of concurrent scanning threads
-- `SCAN_COMMIT_HISTORY` - Whether to scan commit diffs as well
-- `MAX_HISTORY_DEPTH` - Number of recent commits to scan
-- `SCAN_HEROKU_KEYS` - Whether to include the Heroku UUID pattern
-- `FAT_FILE_LIMIT` - Skip files larger than this size
-- `MAX_DOWNLOAD_SIZE_BYTES` - Abort downloads larger than this size
+**`data/signatures.json`**
+- Contains all signature definitions (name + regex + tags).
+- Heroku rules are tagged `heroku` and can be included with `--scan-heroku-keys`.
+
+---
+
+## Outputs and Data Files
+
+**`recent_repos.json`** (discovery queue)
+
+```json
+[
+  {
+    "name": "owner/repo",
+    "created_at": "2024-01-01T00:00:00Z",
+    "url": "https://github.com/owner/repo",
+    "stars": 0
+  }
+]
+```
+
+**`leaked_keys.json`** (findings database)
+
+```json
+[
+  {
+    "repo": "owner/repo",
+    "url": "https://github.com/owner/repo",
+    "status": "leaked",
+    "total_secrets": 2,
+    "findings": [
+      {
+        "file": "path/to/file",
+        "line": 12,
+        "type": "OpenAI API Key (Legacy)",
+        "secret": "sk-..."
+      }
+    ]
+  }
+]
+```
+
+**`clean_repos.json`** (no findings)
+
+```json
+[
+  {
+    "repo": "owner/repo",
+    "url": "https://github.com/owner/repo",
+    "status": "clean"
+  }
+]
+```
+
+**`failed_repos.json`** (download/scan failures)
+
+```json
+[
+  {
+    "repo": "owner/repo",
+    "status": "failed",
+    "reason": "Forbidden 403 (Skipped)"
+  }
+]
+```
 
 ---
 
@@ -223,4 +335,4 @@ Use it responsibly, respect platform rules and rate limits, and follow responsib
 
 ## License
 
-Part of the X3r0Day Framework. Free to use, modify, and redistribute with proper credit to the original project.
+Part of the X3r0Day Framework. Free to use, modify, and redistribute with "**proper credit**" to the original project.
