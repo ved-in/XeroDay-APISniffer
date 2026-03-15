@@ -31,7 +31,8 @@
 # accept full responsibility for your actions.                                       #
 #                                                                                    #
 # Project: X3r0Day Framework                                                         #
-# Author: XeroDay                                                                    #
+# Tool:    X3r0Day's API Sniffer                                                     #
+# Author:  XeroDay                                                                   #
 # ---------------------------------------------------------------------------------- #
 
 
