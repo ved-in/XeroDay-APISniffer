@@ -1,0 +1,2 @@
+- Proxy issue
+- Make other the endpoints better at discovery
