@@ -49,11 +49,11 @@
 
 
 import argparse
-import requests, random, json, io, os, sys, zipfile, re, time, threading, signal, tempfile
+import requests, random, json, io, os, sys, zipfile, re, time, threading, signal, tempfile, tarfile, subprocess, shutil
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from rich.live import Live
 from rich.console import Console
@@ -218,6 +218,202 @@ def ensure_json_list_file(filepath: str) -> None:
     if os.path.exists(filepath):
         return
     write_json_snapshot([], filepath)
+
+
+def build_github_headers() -> dict:
+    headers = {"User-Agent": SPOOFED_USER_AGENT}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        normalized = token.strip()
+        lowered = normalized.lower()
+        if lowered.startswith("bearer ") or lowered.startswith("token "):
+            headers["Authorization"] = normalized
+        else:
+            headers["Authorization"] = f"Bearer {normalized}"
+    return headers
+
+
+def build_archive_url_candidates(repo_name: str, branch: str) -> List[Tuple[str, str, str]]:
+    # (label, url, kind)
+    return [
+        ("ZIP (codeload)", f"https://codeload.github.com/{repo_name}/zip/refs/heads/{branch}", "zip"),
+        ("ZIP (archive)", f"https://github.com/{repo_name}/archive/refs/heads/{branch}.zip", "zip"),
+        ("ZIP (zipball)", f"https://api.github.com/repos/{repo_name}/zipball/{branch}", "zip"),
+        ("TAR (tarball)", f"https://api.github.com/repos/{repo_name}/tarball/{branch}", "tar"),
+    ]
+
+
+def download_repo_archive(repo_name: str, branch: str, thread_tag: str) -> Tuple[Optional[bytes], Optional[str], str]:
+    for label, url, kind in build_archive_url_candidates(repo_name, branch):
+        payload, current_ip = download_github_url(url, thread_tag, f"Downloading {label}")
+        if payload == b"TOO_LARGE":
+            return payload, kind, current_ip
+        if payload == b"FORBIDDEN_SKIP":
+            return payload, kind, current_ip
+        if payload is None:
+            continue
+        if isinstance(payload, bytes) and payload in [b"FAILED"]:
+            continue
+        if isinstance(payload, bytes):
+            return payload, kind, current_ip
+    return None, None, "Direct IP"
+
+
+def should_scan_filename(path: str) -> Tuple[bool, str]:
+    lowered_name = path.lower()
+    clean_filename = os.path.basename(lowered_name)
+    should_scan = lowered_name.endswith(TARGET_EXTENSIONS) or clean_filename in EXACT_FILENAMES
+    return should_scan, clean_filename
+
+
+def scan_zip_bytes(zip_buffer: bytes, thread_tag: str, active_ip: str) -> Tuple[List[dict], Optional[str]]:
+    caught_keys = []
+    last_ui_update = 0
+    total_bytes = 0
+
+    with zipfile.ZipFile(io.BytesIO(zip_buffer)) as zipped_archive:
+        for zipped_file in zipped_archive.infolist():
+            raise_if_exit_requested()
+            check_pause(thread_tag, "[magenta]Scanning File...[/]", active_ip)
+            if zipped_file.is_dir() or zipped_file.file_size > FAT_FILE_LIMIT:
+                continue
+            total_bytes += zipped_file.file_size
+            if total_bytes > MAX_DOWNLOAD_SIZE_BYTES:
+                return caught_keys, "TOO_LARGE"
+
+            should_scan, clean_filename = should_scan_filename(zipped_file.filename)
+            if not should_scan:
+                continue
+
+            if time.time() - last_ui_update > 0.1:
+                short_filename = clean_filename[:25] + ".." if len(clean_filename) > 25 else clean_filename
+                update_thread_board(thread_tag, action=f"[magenta]Scan: {short_filename}[/]", active_ip=active_ip)
+                last_ui_update = time.time()
+
+            try:
+                with zipped_archive.open(zipped_file) as extracted_file:
+                    raw_text = extracted_file.read().decode("utf-8", errors="ignore")
+                caught_keys.extend(regex_grep_text(raw_text, zipped_file.filename))
+            except Exception:
+                pass
+
+    return caught_keys, None
+
+
+def scan_tar_bytes(tar_buffer: bytes, thread_tag: str, active_ip: str) -> Tuple[List[dict], Optional[str]]:
+    caught_keys = []
+    last_ui_update = 0
+    total_bytes = 0
+
+    with tarfile.open(fileobj=io.BytesIO(tar_buffer), mode="r:*") as tar:
+        for member in tar.getmembers():
+            raise_if_exit_requested()
+            check_pause(thread_tag, "[magenta]Scanning File...[/]", active_ip)
+            if not member.isfile() or member.size > FAT_FILE_LIMIT:
+                continue
+            total_bytes += member.size
+            if total_bytes > MAX_DOWNLOAD_SIZE_BYTES:
+                return caught_keys, "TOO_LARGE"
+
+            should_scan, clean_filename = should_scan_filename(member.name)
+            if not should_scan:
+                continue
+
+            if time.time() - last_ui_update > 0.1:
+                short_filename = clean_filename[:25] + ".." if len(clean_filename) > 25 else clean_filename
+                update_thread_board(thread_tag, action=f"[magenta]Scan: {short_filename}[/]", active_ip=active_ip)
+                last_ui_update = time.time()
+
+            try:
+                extracted_file = tar.extractfile(member)
+                if extracted_file is None:
+                    continue
+                raw_text = extracted_file.read().decode("utf-8", errors="ignore")
+                caught_keys.extend(regex_grep_text(raw_text, member.name))
+            except Exception:
+                pass
+
+    return caught_keys, None
+
+
+def scan_repo_dir(repo_dir: str, thread_tag: str, active_ip: str) -> Tuple[List[dict], Optional[str]]:
+    caught_keys = []
+    last_ui_update = 0
+    total_bytes = 0
+
+    for root, dirs, files in os.walk(repo_dir):
+        raise_if_exit_requested()
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for filename in files:
+            raise_if_exit_requested()
+            file_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(file_path, repo_dir)
+            should_scan, clean_filename = should_scan_filename(rel_path)
+            if not should_scan:
+                continue
+            try:
+                file_size = os.path.getsize(file_path)
+            except OSError:
+                continue
+            if file_size > FAT_FILE_LIMIT:
+                continue
+            total_bytes += file_size
+            if total_bytes > MAX_DOWNLOAD_SIZE_BYTES:
+                return caught_keys, "TOO_LARGE"
+
+            if time.time() - last_ui_update > 0.1:
+                short_filename = clean_filename[:25] + ".." if len(clean_filename) > 25 else clean_filename
+                update_thread_board(thread_tag, action=f"[magenta]Scan: {short_filename}[/]", active_ip=active_ip)
+                last_ui_update = time.time()
+
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as extracted_file:
+                    raw_text = extracted_file.read()
+                caught_keys.extend(regex_grep_text(raw_text, rel_path))
+            except Exception:
+                pass
+
+    return caught_keys, None
+
+
+def clone_repo_git(repo_name: str, branch: str, thread_tag: str) -> Tuple[Optional[str], Optional[str]]:
+    update_thread_board(thread_tag, action="[cyan]Cloning (git)...[/]", active_ip="git", dl_bytes=0)
+    temp_dir = tempfile.mkdtemp(prefix="x3d_git_")
+    repo_url = f"https://github.com/{repo_name}.git"
+    cmd = [
+        "git",
+        "clone",
+        "--depth", "1",
+        "--single-branch",
+        "--branch", branch,
+        repo_url,
+        temp_dir,
+    ]
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_LFS_SKIP_SMUDGE"] = "1"
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+            timeout=120,
+            text=True,
+        )
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, "git-exception"
+
+    if result.returncode != 0:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, (result.stderr or "git-failed").strip()
+
+    return temp_dir, None
 
 
 def request_shutdown(_signum=None, _frame=None) -> None:
@@ -629,7 +825,7 @@ def fetch_with_progress(
 def download_github_url(target_url: str, thread_tag: str, action_label: str) -> Tuple[Optional[bytes], str]:
     global active_proxies
     raise_if_exit_requested()
-    http_headers = {"User-Agent": SPOOFED_USER_AGENT}
+    http_headers = build_github_headers()
     
     res = b"FAILED"
     tried_proxies = False
@@ -783,7 +979,8 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
     
     update_thread_board(thread_tag, target=target_repo, action="[yellow]Initializing[/]", active_ip="-", reset_timer=True, dl_bytes=0)
     
-    zip_buffer = None
+    archive_payload: Optional[Union[bytes, str]] = None
+    archive_kind: Optional[str] = None
     successful_ip = "Direct IP"
     branch_candidates = build_archive_branch_candidates(repo_data, thread_tag)
     successful_branch = branch_candidates[0] if branch_candidates else DEFAULT_BRANCH_FALLBACKS[0]
@@ -792,68 +989,82 @@ def dissect_repo_memory(repo_data: dict, thread_tag: str) -> dict:
     # Try the known default branch first, then fall back to common names.
     for git_branch in branch_candidates:
         raise_if_exit_requested()
-        download_link = f"https://codeload.github.com/{target_repo}/zip/refs/heads/{git_branch}"
-        zip_buffer, current_ip = download_github_url(download_link, thread_tag, "Downloading ZIP")
+        archive_payload, archive_kind, current_ip = download_repo_archive(target_repo, git_branch, thread_tag)
         successful_ip = current_ip
-        
+
         # Stop early if the direct IP is consistently forbidden.
-        if zip_buffer == b"FORBIDDEN_SKIP":
+        if archive_payload == b"FORBIDDEN_SKIP":
             break
-            
-        if zip_buffer is not None and zip_buffer not in[b"FAILED", b"TOO_LARGE"]: 
+
+        if archive_payload == b"TOO_LARGE":
+            break
+
+        if isinstance(archive_payload, bytes) and archive_payload not in [b"FAILED"]:
             successful_branch = git_branch
             break
+
+        if archive_payload is None or archive_payload == b"FAILED":
+            git_dir, git_err = clone_repo_git(target_repo, git_branch, thread_tag)
+            if git_dir:
+                archive_payload = git_dir
+                archive_kind = "git"
+                archive_source = "git"
+                successful_ip = "git"
+                successful_branch = git_branch
+                break
             
     elapsed = round(time.time() - start_time, 2)
 
-    if zip_buffer == b"FORBIDDEN_SKIP":
+    if archive_payload == b"FORBIDDEN_SKIP":
         log_dead_repo(target_repo, "Forbidden 403 (Skipped)", successful_ip, elapsed)
         bump_score("failed"); bump_score("scanned")
         return {"repo": target_repo, "status": "failed", "reason": "Forbidden 403 (Skipped)", "ip": successful_ip, "time_taken": elapsed}
 
-    if zip_buffer == b"TOO_LARGE":
+    if archive_payload == b"TOO_LARGE":
         log_dead_repo(target_repo, "Skipped (Over 20MB Limit)", successful_ip, elapsed)
         bump_score("failed"); bump_score("scanned")
         return {"repo": target_repo, "status": "failed", "reason": "Over 20MB Limit", "ip": successful_ip, "time_taken": elapsed}
 
-    if not zip_buffer or zip_buffer == b"FAILED":
-        crash_reason = "Connection Stalled / Exhausted" if zip_buffer == b"FAILED" else "404 Not Found"
+    if not archive_payload or archive_payload == b"FAILED":
+        crash_reason = "Connection Stalled / Exhausted" if archive_payload == b"FAILED" else "404 Not Found"
         log_dead_repo(target_repo, crash_reason, successful_ip, elapsed)
         bump_score("failed"); bump_score("scanned")
         return {"repo": target_repo, "status": "failed", "reason": crash_reason, "ip": successful_ip, "time_taken": elapsed}
 
     update_thread_board(thread_tag, action="[magenta]Extracting...[/]", active_ip=successful_ip, dl_bytes=0)
-    caught_keys =[]
-    last_ui_update = 0 
-    
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_buffer)) as zipped_archive:
-            for zipped_file in zipped_archive.infolist():
-                raise_if_exit_requested()
-                check_pause(thread_tag, "[magenta]Scanning File...[/]", successful_ip)
-                if zipped_file.is_dir() or zipped_file.file_size > FAT_FILE_LIMIT: continue
-                
-                lowered_name = zipped_file.filename.lower()
-                clean_filename = lowered_name.split('/')[-1]
-                
-                # Keep the scan focused on text-like files where secrets usually live.
-                # For example, this skips binaries and large generated assets.
-                if not (lowered_name.endswith(TARGET_EXTENSIONS) or clean_filename in EXACT_FILENAMES): continue
-                
-                if time.time() - last_ui_update > 0.1:
-                    short_filename = clean_filename[:25] + ".." if len(clean_filename) > 25 else clean_filename
-                    update_thread_board(thread_tag, action=f"[magenta]Scan: {short_filename}[/]", active_ip=successful_ip)
-                    last_ui_update = time.time()
+    caught_keys = []
+    scan_status = None
+    git_dir = archive_payload if archive_kind == "git" else None
 
-                try:
-                    with zipped_archive.open(zipped_file) as extracted_file:
-                        raw_text = extracted_file.read().decode('utf-8', errors='ignore')
-                    caught_keys.extend(regex_grep_text(raw_text, zipped_file.filename))
-                except Exception: pass
+    try:
+        if archive_kind == "zip" and isinstance(archive_payload, bytes):
+            caught_keys, scan_status = scan_zip_bytes(archive_payload, thread_tag, successful_ip)
+        elif archive_kind == "tar" and isinstance(archive_payload, bytes):
+            caught_keys, scan_status = scan_tar_bytes(archive_payload, thread_tag, successful_ip)
+        elif archive_kind == "git" and isinstance(archive_payload, str):
+            caught_keys, scan_status = scan_repo_dir(archive_payload, thread_tag, successful_ip)
+        else:
+            scan_status = "FAILED"
     except zipfile.BadZipFile:
         log_dead_repo(target_repo, "Corrupted Zip", successful_ip, round(time.time() - start_time, 2))
         bump_score("failed"); bump_score("scanned")
         return {"repo": target_repo, "status": "failed", "reason": "BadZipFile", "ip": successful_ip, "time_taken": round(time.time() - start_time, 2)}
+    except tarfile.TarError:
+        log_dead_repo(target_repo, "Corrupted Tar", successful_ip, round(time.time() - start_time, 2))
+        bump_score("failed"); bump_score("scanned")
+        return {"repo": target_repo, "status": "failed", "reason": "BadTarFile", "ip": successful_ip, "time_taken": round(time.time() - start_time, 2)}
+    finally:
+        if git_dir:
+            shutil.rmtree(git_dir, ignore_errors=True)
+
+    if scan_status == "TOO_LARGE":
+        log_dead_repo(target_repo, "Skipped (Over 20MB Limit)", successful_ip, round(time.time() - start_time, 2))
+        bump_score("failed"); bump_score("scanned")
+        return {"repo": target_repo, "status": "failed", "reason": "Over 20MB Limit", "ip": successful_ip, "time_taken": round(time.time() - start_time, 2)}
+    if scan_status == "FAILED":
+        log_dead_repo(target_repo, "Scan Failed", successful_ip, round(time.time() - start_time, 2))
+        bump_score("failed"); bump_score("scanned")
+        return {"repo": target_repo, "status": "failed", "reason": "Scan Failed", "ip": successful_ip, "time_taken": round(time.time() - start_time, 2)}
 
     # Scan recent commit history as patch text as well.
     # For example, a key removed from the working tree can still appear in an older commit.
