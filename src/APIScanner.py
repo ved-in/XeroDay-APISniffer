@@ -88,6 +88,7 @@ IDLE_STALL_TIMEOUT_SEC = 15.0
 MAX_DOWNLOAD_SIZE_BYTES = 20 * 1024 * 1024  
 PROXY_TIMEOUTS = (15.0, 20.0)
 PREFER_PROXY = False
+UPDATE_PROXY_FILE = False
 
 TARGET_EXTENSIONS = (
     ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yml", ".yaml", ".xml", 
@@ -146,12 +147,15 @@ def parse_args():
     parser.add_argument("--scan-heroku-keys", action="store_true", help="Enable Heroku key pattern scanning.")
     parser.add_argument("--no-commit-history", action="store_true", help="Disable commit history scanning.")
     parser.add_argument("--prefer-proxy", action="store_true", help="Try proxy download before direct IP.")
+    parser.add_argument("--up-proxy", action="store_true", help="Persist proxy updates to live_proxies.txt.")
     return parser.parse_args()
 
 
 def apply_runtime_overrides(args) -> None:
-    global MAX_THREADS, MAX_HISTORY_DEPTH, SCAN_HEROKU_KEYS, SCAN_COMMIT_HISTORY, PREFER_PROXY
+    global MAX_THREADS, MAX_HISTORY_DEPTH, SCAN_HEROKU_KEYS, SCAN_COMMIT_HISTORY, PREFER_PROXY, UPDATE_PROXY_FILE
 
+    if env_flag_enabled("X3D_UP_PROXY"):
+        UPDATE_PROXY_FILE = True
     if args.max_threads is not None:
         MAX_THREADS = max(1, args.max_threads)
     if args.history_depth is not None:
@@ -162,6 +166,8 @@ def apply_runtime_overrides(args) -> None:
         SCAN_COMMIT_HISTORY = False
     if args.prefer_proxy:
         PREFER_PROXY = True
+    if args.up_proxy:
+        UPDATE_PROXY_FILE = True
 
 
 def reset_runtime_state() -> None:
@@ -220,12 +226,22 @@ def ensure_json_list_file(filepath: str) -> None:
         return
     write_json_snapshot([], filepath)
 
+def env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
 
-def build_github_headers() -> dict:
-    headers = {"User-Agent": SPOOFED_USER_AGENT}
+def get_github_token() -> Optional[str]:
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token:
-        normalized = token.strip()
+    if not token:
+        return None
+    token = token.strip()
+    return token or None
+
+def build_github_headers(token: Optional[str] = None) -> dict:
+    headers = {"User-Agent": SPOOFED_USER_AGENT}
+    token_value = token if token is not None else get_github_token()
+    if token_value:
+        normalized = token_value.strip()
         lowered = normalized.lower()
         if lowered.startswith("bearer ") or lowered.startswith("token "):
             headers["Authorization"] = normalized
@@ -493,10 +509,11 @@ def mark_proxy_bad(proxy_ip: str, reason: bytes) -> None:
         proxy_fail.pop(p, None)
     with good_proxy_lock:
         good_proxies.discard(p)
-    write_proxy_file(get_active_proxies())
+    if UPDATE_PROXY_FILE:
+        write_proxy_file(get_active_proxies())
 
 def save_good_proxies() -> None:
-    if not active_proxies:
+    if not active_proxies or not UPDATE_PROXY_FILE:
         return
     with good_proxy_lock:
         kept = sorted(good_proxies)

@@ -179,6 +179,25 @@ def ensure_json_list_file(filename: str) -> None:
         return
     write_json_snapshot([], filename)
 
+def get_github_token() -> Optional[str]:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        return None
+    token = token.strip()
+    return token or None
+
+def build_github_headers() -> dict:
+    headers = {"User-Agent": SPOOFED_UA}
+    token_value = get_github_token()
+    if token_value:
+        normalized = token_value.strip()
+        lowered = normalized.lower()
+        if lowered.startswith("bearer ") or lowered.startswith("token "):
+            headers["Authorization"] = normalized
+        else:
+            headers["Authorization"] = f"Bearer {normalized}"
+    return headers
+
 
 
 
@@ -188,7 +207,7 @@ def make_request(
     if shutdown_requested:
         raise KeyboardInterrupt
 
-    browser_headers = {"User-Agent": SPOOFED_UA}
+    browser_headers = build_github_headers()
 
     # Try with our real IP first
     try:
