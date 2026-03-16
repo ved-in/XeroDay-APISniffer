@@ -26,6 +26,8 @@ from typing import Iterable, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
+UP_PROXY_ENV = "X3D_UP_PROXY"
+UP_PROXY_FLAG = "--up-proxy"
 
 from rich.console import Console
 from rich.panel import Panel
@@ -344,6 +346,8 @@ def run_manual_control_center() -> None:
 
 
 def main() -> None:
+    if UP_PROXY_FLAG in sys.argv[1:]:
+        os.environ[UP_PROXY_ENV] = "1"
     if not prompt_start_mode():
         stage_name, script_name = STAGES["6"]
         launch_stage(stage_name, script_name)
