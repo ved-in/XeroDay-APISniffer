@@ -32,6 +32,13 @@ PH_LIT = {
     "xxxxxxx",
     "xxxxxxxx",
     "xxxxxxxxx",
+    # These are specifcally for SQL DBMS false positives
+    "localhost",
+    "my_user",
+    "my_password",
+    "user",
+    "USUARIO",
+    "internal-db"
 }
 
 PK_TYPES = {
